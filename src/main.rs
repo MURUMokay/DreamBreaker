@@ -881,11 +881,18 @@ impl DreamBreaker {
             with_header
         };
 
-        if self.show_stats {
-            let overlay = self.view_stats_overlay();
+        let with_game_menu: Element<'_, Message> = if self.game_menu_open && in_game {
+            let overlay = self.view_game_menu_overlay();
             stack![with_dropdown, overlay].into()
         } else {
             with_dropdown
+        };
+
+        if self.show_stats {
+            let overlay = self.view_stats_overlay();
+            stack![with_game_menu, overlay].into()
+        } else {
+            with_game_menu
         }
     }
 
@@ -1056,55 +1063,56 @@ impl DreamBreaker {
     }
 
     fn view_game_header(&self) -> Element<'_, Message> {
-        let sc = self.scale();
-
-        let menu_btn: Element<'_, Message> = container(
+        container(
             button(text("Меню").size(self.ts(16)))
                 .on_press(Message::ToggleGameMenu)
                 .padding(self.s(8.0) as u16),
         )
         .padding(self.s(8.0) as u16)
         .width(Length::Fill)
-        .into();
+        .into()
+    }
 
-        if self.game_menu_open {
-            let menu_items = column![
-                profile_dropdown_btn("Сохранить и выйти", Message::SaveAndExit, sc),
-                profile_dropdown_btn("Настройки", Message::OpenSettingsFromGame, sc),
-                profile_dropdown_btn("Сдаться", Message::Surrender, sc),
-            ]
-            .spacing(self.s(4.0) as u16)
-            .padding(self.s(4.0) as u16);
+    fn view_game_menu_overlay(&self) -> Element<'_, Message> {
+        let sc = self.scale();
 
-            let dropdown: Element<'_, Message> = container(
-                container(menu_items)
-                    .style(|_theme| container::Style {
-                        background: Some(Background::Color(Color::from_rgba(
-                            0.08, 0.08, 0.12, 0.97,
-                        ))),
-                        border: iced::Border {
-                            color: Color::from_rgba(1.0, 1.0, 1.0, 0.15),
-                            width: 1.0,
-                            radius: 4.0.into(),
-                        },
-                        ..Default::default()
-                    })
-                    .padding(self.s(4.0) as u16),
+        let menu_items = column![
+            menu_button("Сохранить и выйти", Message::SaveAndExit, sc),
+            menu_button("Настройки", Message::OpenSettingsFromGame, sc),
+            menu_button("Сдаться", Message::Surrender, sc),
+            Space::with_height(self.s(8.0)),
+        ]
+        .spacing(self.s(8.0) as u16)
+        .padding(self.s(16.0) as u16)
+        .align_x(Alignment::Center);
+
+        let card = container(menu_items).style(|_theme| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.08, 0.08, 0.12, 0.97))),
+            border: iced::Border {
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.18),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        });
+
+        mouse_area(
+            container(
+                container(card)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill),
             )
-            .padding(iced::Padding {
-                top: self.s(44.0),
-                right: 0.0,
-                bottom: 0.0,
-                left: self.s(8.0),
-            })
             .width(Length::Fill)
             .height(Length::Fill)
-            .into();
-
-            stack![menu_btn, dropdown].into()
-        } else {
-            menu_btn
-        }
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.60))),
+                ..Default::default()
+            }),
+        )
+        .on_press(Message::ToggleGameMenu)
+        .into()
     }
 
     fn view_menu(&self) -> Element<'_, Message> {
@@ -1139,18 +1147,6 @@ impl DreamBreaker {
         ]
         .spacing(self.s(8.0) as u16)
         .align_x(Alignment::Center);
-
-        // Добавляем кнопку статистики в главное меню, если пользователь авторизован
-        if self.current_user.is_some() {
-            menu_col = menu_col
-                .push(Space::with_height(self.s(8.0)))
-                .push(icon_button(
-                    Icon::Settings,
-                    "Статистика",
-                    Message::OpenStats,
-                    sc,
-                ));
-        }
 
         menu_col.into()
     }
@@ -1627,7 +1623,7 @@ impl DreamBreaker {
             text(outcome_label).size(self.ts(56)),
             text(outcome_detail).size(self.ts(22)),
             Space::with_height(24),
-            text("── Итоги партии ──").size(18),
+            text("Итоги партии").size(18),
             Space::with_height(8),
             text(format!(
                 "Баланс:          {} / {}",
