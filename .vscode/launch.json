@@ -1,0 +1,33 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug DreamBreaker",
+      "cargo": {
+        "args": ["build", "--bin=dreambreaker"],
+        "filter": {
+          "name": "dreambreaker",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug DreamBreaker (release)",
+      "cargo": {
+        "args": ["build", "--release", "--bin=dreambreaker"],
+        "filter": {
+          "name": "dreambreaker",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

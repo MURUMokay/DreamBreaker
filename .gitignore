@@ -1,0 +1,25 @@
+# Сгенерированные Cargo файлы
+/target/
+
+# Lock-файл: для бинарных приложений КОММИТИТСЯ в репозиторий, не игнорируем.
+# Cargo.lock
+
+# Бэкап-файлы редактора
+**/*.rs.bk
+
+# VS Code: коммитим .vscode/extensions.json, settings.json, launch.json,
+# но игнорируем личные/локальные настройки пользователя.
+.vscode/*.local.json
+.vscode/.ropeproject
+
+# Другие IDE
+.idea/
+*.iml
+
+# OS-специфичное
+.DS_Store
+Thumbs.db
+
+# Окружения и секреты
+.env
+.env.local
