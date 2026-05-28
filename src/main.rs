@@ -1080,7 +1080,6 @@ impl DreamBreaker {
             menu_button("Сохранить и выйти", Message::SaveAndExit, sc),
             menu_button("Настройки", Message::OpenSettingsFromGame, sc),
             menu_button("Сдаться", Message::Surrender, sc),
-            Space::with_height(self.s(8.0)),
         ]
         .spacing(self.s(8.0) as u16)
         .padding(self.s(16.0) as u16)
