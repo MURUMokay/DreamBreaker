@@ -191,6 +191,7 @@ enum Message {
     EndTurn,
     TurnSaved(Result<db::ParticipantState, db::DbError>),
     ContinueGame, // загрузить последнюю игру напрямую
+    BalancesLoaded(Result<Vec<(Uuid, i64, String)>, db::DbError>),
 
     // Настройки
     SetWindowMode(WindowMode),
@@ -817,6 +818,15 @@ impl DreamBreaker {
                 Task::none()
             }
             Message::RollDice => {
+                if self.turn_phase != TurnPhase::WaitingRoll {
+                    return Task::none();
+                }
+                // Блокируем если ходы кончились
+                if let (Some(state), Some(rules)) = (&self.player_state, &self.game_rules) {
+                    if state.moves_made >= rules.max_turns {
+                        return Task::none();
+                    }
+                }
                 // Бросать кубик можно только в фазе WaitingRoll
                 if self.turn_phase != TurnPhase::WaitingRoll {
                     return Task::none();
@@ -856,14 +866,88 @@ impl DreamBreaker {
                 }
             }
             Message::TurnSaved(Ok(new_state)) => {
-                self.player_state = Some(new_state);
+                self.player_state = Some(new_state.clone());
                 self.turn_phase = TurnPhase::WaitingRoll;
                 self.dice_roll = None;
                 self.status = "Ход завершён".to_string();
+
+                // Загружаем балансы всех участников для проверки банкротства
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                if let Some(pool) = self.pool.clone() {
+                    return Task::perform(
+                        async move { db::get_all_balances(&pool, game_id).await },
+                        Message::BalancesLoaded,
+                    );
+                }
                 Task::none()
             }
             Message::TurnSaved(Err(e)) => {
                 self.status = format!("Ошибка сохранения хода: {}", e.0);
+                Task::none()
+            }
+            Message::BalancesLoaded(Ok(balances)) => {
+                let rules = match &self.game_rules {
+                    Some(r) => r.clone(),
+                    None => return Task::none(),
+                };
+                let state = match &self.player_state {
+                    Some(s) => s.clone(),
+                    None => return Task::none(),
+                };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+
+                let moves_left = (rules.max_turns - state.moves_made).max(0);
+
+                // Считаем не-банкротов среди ботов
+                let bots_alive = balances
+                    .iter()
+                    .filter(|(id, balance, utype)| *id != user_id && utype == "bot" && *balance > 0)
+                    .count();
+
+                let player_bankrupt = state.balance <= 0;
+
+                // Победа 1: баланс достиг цели
+                // Победа 2: все боты банкроты, игрок жив
+                let victory =
+                    state.balance >= rules.target_balance || (!player_bankrupt && bots_alive == 0);
+
+                // Поражение 1: ходы кончились, цель не достигнута
+                // Поражение 2: игрок банкрот
+                let defeat = (!victory && moves_left <= 0) || player_bankrupt;
+
+                if victory || defeat {
+                    let status_str = if victory {
+                        "Выиграна"
+                    } else {
+                        "Проиграна"
+                    };
+                    self.status = status_str.to_string();
+
+                    if let (Some(game_id), Some(pool)) = (self.active_game_id, self.pool.clone()) {
+                        return Task::perform(
+                            async move {
+                                db::set_game_status(&pool, game_id, "finished").await?;
+                                db::get_game_result(&pool, game_id, user_id).await
+                            },
+                            Message::GameResultLoaded,
+                        );
+                    }
+                }
+
+                Task::none()
+            }
+            Message::BalancesLoaded(Err(e)) => {
+                self.status = format!("Ошибка проверки балансов: {}", e.0);
+                Task::none()
+            }
+            Message::BalancesLoaded(Err(e)) => {
+                self.status = format!("Ошибка загрузки балансов: {}", e.0);
                 Task::none()
             }
         }
@@ -1460,7 +1544,7 @@ impl DreamBreaker {
             None => return text("Загрузка...").size(24).into(),
         };
 
-        let turns_left = rules.max_turns - state.moves_made;
+        let turns_left = (rules.max_turns - state.moves_made).max(0);
 
         let slot_size = self.s(56.0);
         let mut inv_row = row![].spacing(self.s(3.0) as u16);

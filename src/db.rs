@@ -479,3 +479,22 @@ pub async fn commit_player_move(
     .await?;
     Ok(state)
 }
+// ----- БЛОК 11: Проверка банкротства -----
+
+/// Получить балансы всех участников игры (для проверки банкротства).
+/// Возвращает (user_id, balance, user_type).
+pub async fn get_all_balances(
+    pool: &PgPool,
+    game_id: Uuid,
+) -> Result<Vec<(Uuid, i64, String)>, DbError> {
+    let rows: Vec<(Uuid, i64, String)> = sqlx::query_as(
+        "SELECT gp.user_id, gp.balance, u.type
+         FROM game_participants gp
+         JOIN users u ON u.id = gp.user_id
+         WHERE gp.game_id = $1",
+    )
+    .bind(game_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
