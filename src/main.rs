@@ -39,7 +39,11 @@ const WINDOW_MODES: &[WindowMode] = &[
     WindowMode::Fullscreen,
     WindowMode::Borderless,
 ];
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnPhase {
+    WaitingRoll, // ждём броска кубика
+    Rolled,      // кубик брошен, игрок переместился — можно завершить ход
+}
 // ─────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────
@@ -72,6 +76,9 @@ struct DreamBreaker {
     board_cells: Vec<db::BoardCell>,
     inventory: Vec<db::InventoryItem>,
     game_menu_open: bool,
+    dice_roll: Option<(u8, u8)>,
+    local_player_pos: i32,
+    turn_phase: TurnPhase, // фаза хода
 
     // Экран завершения
     game_result: Option<db::GameResult>,
@@ -107,9 +114,12 @@ impl Default for DreamBreaker {
             active_game_id: None,
             game_rules: None,
             player_state: None,
+            local_player_pos: 0,
             board_cells: vec![],
             inventory: vec![],
             game_menu_open: false,
+            dice_roll: None,
+            turn_phase: TurnPhase::WaitingRoll,
             game_result: None,
             user_stats: None,
             show_stats: false,
@@ -177,6 +187,9 @@ enum Message {
     SaveAndExit,
     Surrender,
     OpenSettingsFromGame,
+    RollDice,
+    EndTurn,
+    TurnSaved(Result<db::ParticipantState, db::DbError>),
     ContinueGame, // загрузить последнюю игру напрямую
 
     // Настройки
@@ -600,6 +613,10 @@ impl DreamBreaker {
                 }
             }
             Message::GameScreenLoaded(Ok((rules, state, cells, inventory))) => {
+                self.local_player_pos = state.position; // <- добавить
+                self.turn_phase = TurnPhase::WaitingRoll; // <- добавить
+                self.dice_roll = None; // <- добавить
+                self.local_player_pos = state.position; // добавить эту строку
                 self.game_rules = Some(rules);
                 self.player_state = Some(state);
                 self.board_cells = cells;
@@ -797,6 +814,56 @@ impl DreamBreaker {
             Message::WindowResized(w, h) => {
                 self.window_width = w;
                 self.window_height = h;
+                Task::none()
+            }
+            Message::RollDice => {
+                // Бросать кубик можно только в фазе WaitingRoll
+                if self.turn_phase != TurnPhase::WaitingRoll {
+                    return Task::none();
+                }
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let seed = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos();
+                let d1 = ((seed % 6) + 1) as u8;
+                let d2 = (((seed / 7) % 6) + 1) as u8;
+                self.dice_roll = Some((d1, d2));
+                self.local_player_pos = (self.local_player_pos + (d1 + d2) as i32) % 40;
+                self.turn_phase = TurnPhase::Rolled;
+                Task::none()
+            }
+            Message::EndTurn => {
+                if self.turn_phase != TurnPhase::Rolled {
+                    return Task::none();
+                }
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+                let new_pos = self.local_player_pos;
+                if let Some(pool) = self.pool.clone() {
+                    Task::perform(
+                        async move { db::commit_player_move(&pool, game_id, user_id, new_pos).await },
+                        Message::TurnSaved,
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Message::TurnSaved(Ok(new_state)) => {
+                self.player_state = Some(new_state);
+                self.turn_phase = TurnPhase::WaitingRoll;
+                self.dice_roll = None;
+                self.status = "Ход завершён".to_string();
+                Task::none()
+            }
+            Message::TurnSaved(Err(e)) => {
+                self.status = format!("Ошибка сохранения хода: {}", e.0);
                 Task::none()
             }
         }
@@ -1433,10 +1500,26 @@ impl DreamBreaker {
             inv_row = inv_row.push(cell);
         }
 
+        let icon_size = self.ts(14) as f32 * 0.75;
+
         let stats_panel = container(
             column![
-                text(format!("Баланс:   {}", state.balance)).size(self.ts(14)),
-                text(format!("Цель:     {}", rules.target_balance)).size(self.ts(14)),
+                row![
+                    svg(std::path::Path::new("assets/money_icon.svg"))
+                        .width(Length::Fixed(icon_size))
+                        .height(Length::Fixed(icon_size)),
+                    text(format!("Баланс:   {}", state.balance)).size(self.ts(14)),
+                ]
+                .spacing(self.s(4.0) as u16)
+                .align_y(Alignment::Center),
+                row![
+                    svg(std::path::Path::new("assets/money_icon.svg"))
+                        .width(Length::Fixed(icon_size))
+                        .height(Length::Fixed(icon_size)),
+                    text(format!("Цель:     {}", rules.target_balance)).size(self.ts(14)),
+                ]
+                .spacing(self.s(4.0) as u16)
+                .align_y(Alignment::Center),
                 text(format!(
                     "Ходов:    {}/{}",
                     state.moves_made, rules.max_turns
@@ -1462,22 +1545,72 @@ impl DreamBreaker {
         });
 
         let cell_size = self.s(54.0);
-        let panel_offset = cell_size + self.s(6.0);
+        let top_offset = cell_size * 1.5;
 
-        let panel_overlay: Element<'_, Message> = container(container(stats_panel).padding(0))
+        // Кнопка броска кубика + результат
+        let dice_result_text: Element<'_, Message> = match self.dice_roll {
+            Some((d1, d2)) => text(format!("{} + {} = {}", d1, d2, d1 + d2))
+                .size(self.ts(16))
+                .into(),
+            None => text("").size(self.ts(16)).into(),
+        };
+
+        let roll_btn = if self.turn_phase == TurnPhase::WaitingRoll {
+            button(text("Бросить кубик").size(self.ts(15)))
+                .on_press(Message::RollDice)
+                .padding(self.s(10.0) as u16)
+                .width(Length::Fixed(self.s(180.0)))
+        } else {
+            button(text("Бросить кубик").size(self.ts(15)))
+                .padding(self.s(10.0) as u16)
+                .width(Length::Fixed(self.s(180.0)))
+            // нет on_press — кнопка неактивна
+        };
+
+        let end_btn = if self.turn_phase == TurnPhase::Rolled {
+            button(text("Завершить ход").size(self.ts(15)))
+                .on_press(Message::EndTurn)
+                .padding(self.s(10.0) as u16)
+                .width(Length::Fixed(self.s(180.0)))
+        } else {
+            button(text("Завершить ход").size(self.ts(15)))
+                .padding(self.s(10.0) as u16)
+                .width(Length::Fixed(self.s(180.0)))
+        };
+
+        let dice_block: Element<'_, Message> = column![
+            roll_btn,
+            dice_result_text,
+            Space::with_height(self.s(4.0)),
+            end_btn,
+        ]
+        .spacing(self.s(6.0) as u16)
+        .align_x(Alignment::Center)
+        .into();
+
+        let center_panel: Element<'_, Message> = column![
+            container(stats_panel).padding(0),
+            Space::with_height(self.s(14.0)),
+            dice_block,
+        ]
+        .align_x(Alignment::Center)
+        .spacing(0)
+        .into();
+
+        let panel_overlay: Element<'_, Message> = container(center_panel)
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(iced::Padding {
-                top: panel_offset,
+                top: top_offset,
                 right: 0.0,
                 bottom: 0.0,
-                left: panel_offset,
+                left: 0.0,
             })
-            .align_x(iced::alignment::Horizontal::Left)
+            .align_x(iced::alignment::Horizontal::Center)
             .align_y(iced::alignment::Vertical::Top)
             .into();
 
-        let board = self.view_board(state.position);
+        let board = self.view_board(self.local_player_pos);
 
         stack![board, panel_overlay]
             .width(Length::Fill)
@@ -1487,9 +1620,10 @@ impl DreamBreaker {
 
     fn view_board(&self, player_pos: i32) -> Element<'_, Message> {
         const GRID: usize = 11;
+
         let mut grid: Vec<Vec<Option<i32>>> = vec![vec![None; GRID]; GRID];
         for i in 0..10usize {
-            grid[10][10 - i] = Some(i as i32);
+            grid[10][i] = Some(i as i32);
         }
         for i in 0..10usize {
             grid[10 - i][10] = Some((10 + i) as i32);
@@ -1501,12 +1635,27 @@ impl DreamBreaker {
             grid[i][0] = Some((30 + i) as i32);
         }
 
+        let side_of = |idx: i32| -> &'static str {
+            match idx {
+                0..=9 => "bottom",
+                10..=19 => "right",
+                20..=29 => "top",
+                _ => "left",
+            }
+        };
+
         let cell_map: std::collections::HashMap<i32, &db::BoardCell> =
             self.board_cells.iter().map(|c| (c.cell_index, c)).collect();
 
         let available_h = self.window_height - self.s(40.0) - self.s(28.0);
         let available_w = self.window_width;
+
+        // Уменьшаем поле чтобы снаружи оставалось место для иконки
+        let icon_size = self.s(28.0);
         let cell_size = (available_h / 11.0).min(available_w / 11.0).floor();
+
+        let fs = (cell_size / 54.0 * 10.0).max(7.0);
+        let fs_sm = (cell_size / 54.0 * 9.0).max(6.0);
 
         let mut board_col = column![].spacing(1);
         for row_i in 0..GRID {
@@ -1514,12 +1663,108 @@ impl DreamBreaker {
             for col_i in 0..GRID {
                 let cell_elem: Element<'_, Message> = match grid[row_i][col_i] {
                     None => Space::new(Length::Fixed(cell_size), Length::Fixed(cell_size)).into(),
-                    Some(idx) => match cell_map.get(&idx) {
-                        Some(cell) => self.view_board_cell(cell, player_pos == idx, cell_size),
-                        None => {
-                            Space::new(Length::Fixed(cell_size), Length::Fixed(cell_size)).into()
+                    Some(idx) => {
+                        let is_player = player_pos == idx;
+                        let side = side_of(idx);
+
+                        let (label, sublabel) = if idx == 0 {
+                            ("СТАРТ".to_string(), String::new())
+                        } else {
+                            match cell_map.get(&idx) {
+                                Some(cell) => match cell.cell_type.as_str() {
+                                    "tax" => ("НАЛОГ".to_string(), "100+5%".to_string()),
+                                    "shop" => ("МАГ".to_string(), String::new()),
+                                    "empty" => (String::new(), String::new()),
+                                    "property" => {
+                                        let short = cell
+                                            .prop_name
+                                            .as_deref()
+                                            .unwrap_or("?")
+                                            .split_whitespace()
+                                            .last()
+                                            .unwrap_or("?");
+                                        (
+                                            short.chars().take(7).collect(),
+                                            format!("{}", cell.purchase_cost.unwrap_or(0)),
+                                        )
+                                    }
+                                    _ => (String::new(), String::new()),
+                                },
+                                None => (String::new(), String::new()),
+                            }
+                        };
+
+                        let owner_mark = cell_map
+                            .get(&idx)
+                            .and_then(|c| c.owner_user_id)
+                            .map(|_| text("*").size(fs_sm))
+                            .unwrap_or_else(|| text(" ").size(fs_sm));
+
+                        let cell_body: Element<'_, Message> = container(
+                            column![text(label).size(fs), text(sublabel).size(fs_sm), owner_mark,]
+                                .align_x(Alignment::Center)
+                                .spacing(1)
+                                .padding(2),
+                        )
+                        .width(Length::Fixed(cell_size))
+                        .height(Length::Fixed(cell_size))
+                        .style(move |_theme| container::Style {
+                            background: if is_player {
+                                Some(Background::Color(Color::from_rgba(0.8, 0.7, 0.0, 0.35)))
+                            } else {
+                                None
+                            },
+                            ..Default::default()
+                        })
+                        .into();
+
+                        if !is_player {
+                            cell_body
+                        } else {
+                            let icon: Element<'_, Message> =
+                                svg(std::path::Path::new("assets/player_icon.svg"))
+                                    .width(Length::Fixed(icon_size))
+                                    .height(Length::Fixed(icon_size))
+                                    .into();
+
+                            // Смещаем иконку через Space внутри row/column,
+                            // всё это в stack поверх клетки — размер stack = cell_size
+                            let icon_layer: Element<'_, Message> = match side {
+                                "bottom" => {
+                                    let spacer_x = Space::with_width(
+                                        (cell_size / 2.0 - icon_size / 2.0).max(0.0),
+                                    );
+                                    let spacer_y = Space::with_height(cell_size);
+                                    column![spacer_y, row![spacer_x, icon]].into()
+                                }
+                                "right" => {
+                                    let spacer_x = Space::with_width(cell_size);
+                                    let spacer_y = Space::with_height(
+                                        (cell_size / 2.0 - icon_size / 2.0).max(0.0),
+                                    );
+                                    row![spacer_x, column![spacer_y, icon]].into()
+                                }
+                                "top" => {
+                                    let spacer_x = Space::with_width(
+                                        (cell_size / 2.0 - icon_size / 2.0).max(0.0),
+                                    );
+                                    row![spacer_x, icon].into()
+                                }
+                                _ => {
+                                    // left
+                                    let spacer_y = Space::with_height(
+                                        (cell_size / 2.0 - icon_size / 2.0).max(0.0),
+                                    );
+                                    column![spacer_y, icon].into()
+                                }
+                            };
+
+                            stack![cell_body, icon_layer]
+                                .width(Length::Fixed(cell_size))
+                                .height(Length::Fixed(cell_size))
+                                .into()
                         }
-                    },
+                    }
                 };
                 board_row = board_row.push(cell_elem);
             }
@@ -1532,60 +1777,6 @@ impl DreamBreaker {
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .into()
-    }
-
-    fn view_board_cell(
-        &self,
-        cell: &db::BoardCell,
-        is_player: bool,
-        size: f32,
-    ) -> Element<'_, Message> {
-        let fs = (size / 54.0 * 10.0).max(7.0);
-        let fs_sm = (size / 54.0 * 9.0).max(6.0);
-
-        let marker = if is_player {
-            text("[ ]").size(fs)
-        } else {
-            text(" ").size(fs)
-        };
-        let (label, sublabel) = match cell.cell_type.as_str() {
-            "start" => ("СТАРТ".to_string(), String::new()),
-            "tax" => ("НАЛОГ".to_string(), "100+5%".to_string()),
-            "shop" => ("МАГ".to_string(), String::new()),
-            "empty" => (String::new(), String::new()),
-            "property" => {
-                let short = cell
-                    .prop_name
-                    .as_deref()
-                    .unwrap_or("?")
-                    .split_whitespace()
-                    .last()
-                    .unwrap_or("?");
-                (
-                    short.chars().take(7).collect(),
-                    format!("{}", cell.purchase_cost.unwrap_or(0)),
-                )
-            }
-            _ => (String::new(), String::new()),
-        };
-        container(
-            column![
-                marker,
-                text(label).size(fs),
-                text(sublabel).size(fs_sm),
-                if cell.owner_user_id.is_some() {
-                    text("*").size(fs_sm)
-                } else {
-                    text(" ").size(fs_sm)
-                },
-            ]
-            .align_x(Alignment::Center)
-            .spacing(1)
-            .padding(2),
-        )
-        .width(Length::Fixed(size))
-        .height(Length::Fixed(size))
-        .into()
     }
 
     fn view_game_over(&self) -> Element<'_, Message> {

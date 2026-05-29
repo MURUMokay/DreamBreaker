@@ -462,3 +462,20 @@ pub async fn get_latest_user_game(pool: &PgPool, user_id: Uuid) -> Result<Option
     .await?;
     Ok(row.map(|(id, _, _, _, _)| id))
 }
+pub async fn commit_player_move(
+    pool: &PgPool,
+    game_id: Uuid,
+    user_id: Uuid,
+    new_position: i32,
+) -> Result<ParticipantState, DbError> {
+    let state = sqlx::query_as::<_, ParticipantState>(
+        "SELECT \"position\", balance, moves_made, total_spent, total_earned
+         FROM commit_player_move($1, $2, $3)",
+    )
+    .bind(game_id)
+    .bind(user_id)
+    .bind(new_position)
+    .fetch_one(pool)
+    .await?;
+    Ok(state)
+}
