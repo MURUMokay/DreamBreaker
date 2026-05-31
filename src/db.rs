@@ -483,18 +483,156 @@ pub async fn commit_player_move(
 
 /// Получить балансы всех участников игры (для проверки банкротства).
 /// Возвращает (user_id, balance, user_type).
+/// Вызывает функцию БД: get_all_balances(game_id).
 pub async fn get_all_balances(
     pool: &PgPool,
     game_id: Uuid,
 ) -> Result<Vec<(Uuid, i64, String)>, DbError> {
-    let rows: Vec<(Uuid, i64, String)> = sqlx::query_as(
-        "SELECT gp.user_id, gp.balance, u.type
-         FROM game_participants gp
-         JOIN users u ON u.id = gp.user_id
-         WHERE gp.game_id = $1",
+    let rows: Vec<(Uuid, i64, String)> =
+        sqlx::query_as("SELECT user_id, balance, user_type FROM get_all_balances($1)")
+            .bind(game_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}
+
+// ----- БЛОК 12: Покупка и аренда -----
+
+pub async fn buy_property(
+    pool: &PgPool,
+    game_id: Uuid,
+    user_id: Uuid,
+    cell_index: i32,
+) -> Result<ParticipantState, DbError> {
+    let state = sqlx::query_as::<_, ParticipantState>(
+        "SELECT \"position\", balance, moves_made, total_spent, total_earned
+         FROM buy_property($1, $2, $3)",
     )
     .bind(game_id)
+    .bind(user_id)
+    .bind(cell_index)
+    .fetch_one(pool)
+    .await?;
+    Ok(state)
+}
+
+pub async fn pay_rent(
+    pool: &PgPool,
+    game_id: Uuid,
+    user_id: Uuid,
+    cell_index: i32,
+) -> Result<ParticipantState, DbError> {
+    let state = sqlx::query_as::<_, ParticipantState>(
+        "SELECT \"position\", balance, moves_made, total_spent, total_earned
+         FROM pay_rent($1, $2, $3)",
+    )
+    .bind(game_id)
+    .bind(user_id)
+    .bind(cell_index)
+    .fetch_one(pool)
+    .await?;
+    Ok(state)
+}
+// ----- БЛОК 13: Магазин усилений -----
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ShopSlot {
+    pub slot_index: i32,
+    pub slot_id: Uuid,
+    pub power_up_id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub cost: i64,
+    pub status: String,
+    pub already_own: bool,
+    pub reroll_count: i32, // <- добавить
+}
+
+pub async fn get_shop_slots(
+    pool: &PgPool,
+    shop_id: Uuid,
+    game_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<ShopSlot>, DbError> {
+    let slots = sqlx::query_as::<_, ShopSlot>(
+        "SELECT slot_index, slot_id, power_up_id, name, description,
+                cost, status, already_own, reroll_count
+         FROM get_shop_slots($1, $2, $3)",
+    )
+    .bind(shop_id)
+    .bind(game_id)
+    .bind(user_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    Ok(slots)
+}
+
+pub async fn buy_shop_slot(
+    pool: &PgPool,
+    slot_id: Uuid,
+    game_id: Uuid,
+    user_id: Uuid,
+) -> Result<ParticipantState, DbError> {
+    let state = sqlx::query_as::<_, ParticipantState>(
+        "SELECT \"position\", balance, moves_made, total_spent, total_earned
+         FROM buy_shop_slot($1, $2, $3)",
+    )
+    .bind(slot_id)
+    .bind(game_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(state)
+}
+
+pub async fn reroll_shop(
+    pool: &PgPool,
+    shop_id: Uuid,
+    game_id: Uuid,
+    user_id: Uuid,
+) -> Result<ParticipantState, DbError> {
+    let state = sqlx::query_as::<_, ParticipantState>(
+        "SELECT \"position\", balance, moves_made, total_spent, total_earned
+         FROM reroll_shop($1, $2, $3)",
+    )
+    .bind(shop_id)
+    .bind(game_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(state)
+}
+pub async fn pay_tax(
+    pool: &PgPool,
+    game_id: Uuid,
+    user_id: Uuid,
+) -> Result<ParticipantState, DbError> {
+    let state = sqlx::query_as::<_, ParticipantState>(
+        "SELECT \"position\", balance, moves_made, total_spent, total_earned
+         FROM pay_tax($1, $2)",
+    )
+    .bind(game_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(state)
+}
+// ----- БЛОК 14: Продажа усилений -----
+
+pub async fn sell_power_up(
+    pool: &PgPool,
+    game_id: Uuid,
+    user_id: Uuid,
+    power_up_id: Uuid,
+) -> Result<ParticipantState, DbError> {
+    let state = sqlx::query_as::<_, ParticipantState>(
+        "SELECT \"position\", balance, moves_made, total_spent, total_earned
+         FROM sell_power_up($1, $2, $3)",
+    )
+    .bind(game_id)
+    .bind(user_id)
+    .bind(power_up_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(state)
 }

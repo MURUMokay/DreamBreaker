@@ -210,8 +210,8 @@ BEGIN
 
     -- Заполняем каждый магазин 3 слотами (циклически по shuffled list)
     FOR v_shop_counter IN 1..array_length(v_shop_ids, 1) LOOP
-        FOR v_slot IN 0..2 LOOP
-            v_pu_index := ((v_shop_counter - 1) * 3 + v_slot)
+        FOR v_slot IN 0..3 LOOP
+            v_pu_index := ((v_shop_counter - 1) * 4 + v_slot)
                           % array_length(v_shuffled_ids, 1) + 1;
 
             INSERT INTO shop_slots (shop_id, power_up_id, slot_index, status, cost)

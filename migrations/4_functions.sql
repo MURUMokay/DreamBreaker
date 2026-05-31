@@ -481,15 +481,13 @@ END;
 
 $$ LANGUAGE plpgsql;
 -- -------------------------------------------------------------------
--- -------------------------------------------------------------------
 -- БЛОК 5: Ходы
 -- -------------------------------------------------------------------
 
 -- Зафиксировать ход игрока: обновить позицию и счётчик ходов.
 -- Возвращает обновлённое состояние участника.
--- Сигнатура идентична get_participant_state для совместимости с Rust.
+-- Алиасы out_* чтобы избежать неоднозначности с колонками таблицы.
 DROP FUNCTION IF EXISTS commit_player_move(UUID, UUID, INT);
-
 CREATE OR REPLACE FUNCTION commit_player_move(
     p_game_id      UUID,
     p_user_id      UUID,
@@ -503,24 +501,528 @@ RETURNS TABLE (
     total_earned BIGINT
 ) AS $$
 DECLARE
-    v_position   INT;
-    v_balance    BIGINT;
+    v_old_pos   INT;
+    v_old_moves INT;
+    v_bonus     BIGINT := 0;
+    v_pos       INT;
+    v_bal       BIGINT;
+    v_moves     INT;
+    v_spent     BIGINT;
+    v_earned    BIGINT;
+BEGIN
+    SELECT gp.position, gp.moves_made INTO v_old_pos, v_old_moves
+    FROM game_participants gp
+    WHERE gp.game_id = p_game_id AND gp.user_id = p_user_id;
+
+    -- Бонус за старт (не начислять на первом ходу)
+    IF v_old_moves > 0 THEN
+        IF p_new_position = 0 THEN
+            v_bonus := 400;
+        ELSIF v_old_pos > p_new_position THEN
+            v_bonus := 200;
+        END IF;
+    END IF;
+
+    UPDATE game_participants gp3
+    SET position     = p_new_position,
+        moves_made   = v_old_moves + 1,
+        balance      = gp3.balance + v_bonus,
+        total_earned = gp3.total_earned + v_bonus
+    WHERE gp3.game_id = p_game_id AND gp3.user_id = p_user_id;
+
+    SELECT gp2.position, gp2.balance, gp2.moves_made, gp2.total_spent, gp2.total_earned
+    INTO v_pos, v_bal, v_moves, v_spent, v_earned
+    FROM game_participants gp2
+    WHERE gp2.game_id = p_game_id AND gp2.user_id = p_user_id;
+
+    RETURN QUERY SELECT v_pos, v_bal, v_moves, v_spent, v_earned;
+END;
+$$ LANGUAGE plpgsql;
+-- -------------------------------------------------------------------
+-- БЛОК 6: Покупка собственности и аренда
+-- -------------------------------------------------------------------
+
+DROP FUNCTION IF EXISTS buy_property(UUID, UUID, INT);
+CREATE OR REPLACE FUNCTION buy_property(
+    p_game_id    UUID,
+    p_user_id    UUID,
+    p_cell_index INT
+)
+RETURNS TABLE (
+    "position"   INT,
+    balance      BIGINT,
+    moves_made   INT,
+    total_spent  BIGINT,
+    total_earned BIGINT
+) AS $$
+DECLARE
+    v_prop_id  UUID;
+    v_cost     BIGINT;
+    v_pos      INT;
+    v_bal      BIGINT;
+    v_moves    INT;
+    v_spent    BIGINT;
+    v_earned   BIGINT;
+BEGIN
+    -- Получаем property_id через game_cells
+    SELECT gc.property_id INTO v_prop_id
+    FROM game_cells gc
+    WHERE gc.game_id = p_game_id AND gc.cell_index = p_cell_index;
+
+    IF v_prop_id IS NULL THEN
+        RAISE EXCEPTION 'Собственность не найдена на клетке %', p_cell_index;
+    END IF;
+
+    SELECT p.purchase_cost INTO v_cost
+    FROM properties p WHERE p.id = v_prop_id;
+
+    -- Проверка баланса
+    SELECT gp.balance INTO v_bal
+    FROM game_participants gp
+    WHERE gp.game_id = p_game_id AND gp.user_id = p_user_id;
+
+    IF v_bal < v_cost THEN
+        RAISE EXCEPTION 'Недостаточно средств: нужно %, есть %', v_cost, v_bal;
+    END IF;
+
+    -- Списать деньги
+    UPDATE game_participants gp2
+    SET balance     = gp2.balance - v_cost,
+        total_spent = gp2.total_spent + v_cost
+    WHERE gp2.game_id = p_game_id AND gp2.user_id = p_user_id;
+
+    -- Записать владельца
+    UPDATE properties
+    SET owner_game_id = p_game_id,
+        owner_user_id = p_user_id
+    WHERE id = v_prop_id;
+
+    -- Вернуть обновлённое состояние через переменные
+    SELECT gp3.position, gp3.balance, gp3.moves_made, gp3.total_spent, gp3.total_earned
+    INTO v_pos, v_bal, v_moves, v_spent, v_earned
+    FROM game_participants gp3
+    WHERE gp3.game_id = p_game_id AND gp3.user_id = p_user_id;
+
+    RETURN QUERY SELECT v_pos, v_bal, v_moves, v_spent, v_earned;
+END;
+$$ LANGUAGE plpgsql;
+
+
+DROP FUNCTION IF EXISTS pay_rent(UUID, UUID, INT);
+CREATE OR REPLACE FUNCTION pay_rent(
+    p_game_id    UUID,
+    p_user_id    UUID,
+    p_cell_index INT
+)
+RETURNS TABLE (
+    "position"   INT,
+    balance      BIGINT,
+    moves_made   INT,
+    total_spent  BIGINT,
+    total_earned BIGINT
+) AS $$
+DECLARE
+    v_prop_id  UUID;
+    v_owner_id UUID;
+    v_rent     BIGINT;
+    v_pos      INT;
+    v_bal      BIGINT;
+    v_moves    INT;
+    v_spent    BIGINT;
+    v_earned   BIGINT;
+BEGIN
+    SELECT gc.property_id INTO v_prop_id
+    FROM game_cells gc
+    WHERE gc.game_id = p_game_id AND gc.cell_index = p_cell_index;
+
+    IF v_prop_id IS NULL THEN
+        RAISE EXCEPTION 'Собственность не найдена на клетке %', p_cell_index;
+    END IF;
+
+    SELECT p.rent_cost, p.owner_user_id INTO v_rent, v_owner_id
+    FROM properties p WHERE p.id = v_prop_id;
+
+    -- Списать аренду у арендатора
+    UPDATE game_participants gp2
+    SET balance     = gp2.balance - v_rent,
+        total_spent = gp2.total_spent + v_rent
+    WHERE gp2.game_id = p_game_id AND gp2.user_id = p_user_id;
+
+    -- Начислить владельцу
+    UPDATE game_participants gp3
+    SET balance      = gp3.balance + v_rent,
+        total_earned = gp3.total_earned + v_rent
+    WHERE gp3.game_id = p_game_id AND gp3.user_id = v_owner_id;
+
+    -- Вернуть обновлённое состояние арендатора через переменные
+    SELECT gp4.position, gp4.balance, gp4.moves_made, gp4.total_spent, gp4.total_earned
+    INTO v_pos, v_bal, v_moves, v_spent, v_earned
+    FROM game_participants gp4
+    WHERE gp4.game_id = p_game_id AND gp4.user_id = p_user_id;
+
+    RETURN QUERY SELECT v_pos, v_bal, v_moves, v_spent, v_earned;
+END;
+$$ LANGUAGE plpgsql;
+
+-- -------------------------------------------------------------------
+-- БЛОК 7: Магазин усилений
+-- -------------------------------------------------------------------
+
+-- Получить слоты магазина по shop_id.
+-- Возвращает 4 слота с усилениями (или NULL если слот пуст/продан).
+DROP FUNCTION IF EXISTS get_shop_slots(UUID, UUID, UUID);
+CREATE OR REPLACE FUNCTION get_shop_slots(
+    p_shop_id  UUID,
+    p_game_id  UUID,
+    p_user_id  UUID
+)
+RETURNS TABLE (
+    slot_index    INT,
+    slot_id       UUID,
+    power_up_id   UUID,
+    name          TEXT,
+    description   TEXT,
+    cost          BIGINT,
+    status        TEXT,
+    already_own   BOOLEAN,
+    reroll_count  INT
+) AS $$
+DECLARE
+    v_offset INT;
+BEGIN
+    SELECT s.offset_value INTO v_offset
+    FROM shops s WHERE s.id = p_shop_id;
+
+    RETURN QUERY
+    SELECT
+        ss.slot_index,
+        ss.id,
+        ss.power_up_id,
+        pu.name::TEXT,
+        pu.description::TEXT,
+        ss.cost,
+        ss.status::TEXT,
+        EXISTS (
+            SELECT 1 FROM player_inventory pi
+            WHERE pi.game_id = p_game_id
+              AND pi.user_id = p_user_id
+              AND pi.power_up_id = ss.power_up_id
+        ),
+        v_offset
+    FROM shop_slots ss
+    JOIN power_ups pu ON pu.id = ss.power_up_id
+    WHERE ss.shop_id = p_shop_id
+    ORDER BY ss.slot_index;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- Купить усиление из магазина.
+-- Списывает деньги, добавляет в инвентарь, помечает слот как sold.
+DROP FUNCTION IF EXISTS buy_shop_slot(UUID, UUID, UUID);
+CREATE OR REPLACE FUNCTION buy_shop_slot(
+    p_slot_id  UUID,
+    p_game_id  UUID,
+    p_user_id  UUID
+)
+RETURNS TABLE (
+    "position"   INT,
+    balance      BIGINT,
+    moves_made   INT,
+    total_spent  BIGINT,
+    total_earned BIGINT
+) AS $$
+DECLARE
+    v_cost       BIGINT;
+    v_pu_id      UUID;
+    v_status     TEXT;
+    v_pos        INT;
+    v_bal        BIGINT;
     v_moves      INT;
     v_spent      BIGINT;
     v_earned     BIGINT;
 BEGIN
-    UPDATE game_participants
-    SET position   = p_new_position,
-        moves_made = game_participants.moves_made + 1
-    WHERE game_id = p_game_id
-      AND user_id = p_user_id;
+    SELECT ss.cost, ss.power_up_id, ss.status
+    INTO v_cost, v_pu_id, v_status
+    FROM shop_slots ss WHERE ss.id = p_slot_id;
 
-    SELECT gp.position, gp.balance, gp.moves_made, gp.total_spent, gp.total_earned
-    INTO v_position, v_balance, v_moves, v_spent, v_earned
+    IF v_status != 'available' THEN
+        RAISE EXCEPTION 'Слот недоступен';
+    END IF;
+
+    SELECT gp.balance INTO v_bal
     FROM game_participants gp
-    WHERE gp.game_id = p_game_id
-      AND gp.user_id = p_user_id;
+    WHERE gp.game_id = p_game_id AND gp.user_id = p_user_id;
 
-    RETURN QUERY SELECT v_position, v_balance, v_moves, v_spent, v_earned;
+    IF v_bal < v_cost THEN
+        RAISE EXCEPTION 'Недостаточно средств: нужно %, есть %', v_cost, v_bal;
+    END IF;
+
+    -- Списать деньги
+    UPDATE game_participants gp2
+    SET balance     = gp2.balance - v_cost,
+        total_spent = gp2.total_spent + v_cost
+    WHERE gp2.game_id = p_game_id AND gp2.user_id = p_user_id;
+
+    -- Добавить в инвентарь
+    INSERT INTO player_inventory (game_id, user_id, power_up_id, quantity)
+    VALUES (p_game_id, p_user_id, v_pu_id, 1)
+    ON CONFLICT (game_id, user_id, power_up_id)
+    DO UPDATE SET quantity = player_inventory.quantity + 1;
+
+    -- Пометить слот как проданный
+    UPDATE shop_slots SET status = 'sold' WHERE id = p_slot_id;
+
+    SELECT gp3.position, gp3.balance, gp3.moves_made, gp3.total_spent, gp3.total_earned
+    INTO v_pos, v_bal, v_moves, v_spent, v_earned
+    FROM game_participants gp3
+    WHERE gp3.game_id = p_game_id AND gp3.user_id = p_user_id;
+
+    RETURN QUERY SELECT v_pos, v_bal, v_moves, v_spent, v_earned;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- Реролл магазина: заменить все слоты новой четвёркой усилений.
+-- Не выдаёт усиления из инвентаря игрока и не дублирует в рамках четвёрки.
+-- Стоимость реролла: 50 + 15 * кол-во_реролов_этого_магазина.
+DROP FUNCTION IF EXISTS reroll_shop(UUID, UUID, UUID);
+CREATE OR REPLACE FUNCTION reroll_shop(
+    p_shop_id  UUID,
+    p_game_id  UUID,
+    p_user_id  UUID
+)
+RETURNS TABLE (
+    "position"   INT,
+    balance      BIGINT,
+    moves_made   INT,
+    total_spent  BIGINT,
+    total_earned BIGINT
+) AS $$
+DECLARE
+    v_reroll_count INT;
+    v_cost         BIGINT;
+    v_bal          BIGINT;
+    v_game_seed    BIGINT;
+    v_available    UUID[];
+    v_chosen       UUID[] := '{}';
+    v_pu_id        UUID;
+    v_i            INT;
+    v_hash         TEXT;
+    v_idx          INT;
+    v_pos          INT;
+    v_moves        INT;
+    v_spent        BIGINT;
+    v_earned       BIGINT;
+BEGIN
+    -- Считаем сколько раз уже делали реролл через offset_value магазина
+    SELECT COALESCE(s.offset_value, 0) INTO v_reroll_count
+    FROM shops s WHERE s.id = p_shop_id;
+
+    v_cost := 50 + 15 * v_reroll_count;
+
+    SELECT gp.balance INTO v_bal
+    FROM game_participants gp
+    WHERE gp.game_id = p_game_id AND gp.user_id = p_user_id;
+
+    IF v_bal < v_cost THEN
+        RAISE EXCEPTION 'Недостаточно средств для реролла: нужно %, есть %', v_cost, v_bal;
+    END IF;
+
+    -- Seed игры для детерминированной генерации
+    SELECT g.seed INTO v_game_seed FROM games g WHERE g.id = p_game_id;
+
+    -- Все усиления которых нет в инвентаре игрока
+    SELECT ARRAY(
+        SELECT pu.id FROM power_ups pu
+        WHERE NOT EXISTS (
+            SELECT 1 FROM player_inventory pi
+            WHERE pi.game_id = p_game_id
+              AND pi.user_id = p_user_id
+              AND pi.power_up_id = pu.id
+        )
+        ORDER BY md5((v_game_seed::TEXT || p_shop_id::TEXT ||
+                      v_reroll_count::TEXT || pu.id::TEXT))
+    ) INTO v_available;
+
+    -- Выбираем 4 уникальных усиления
+    v_i := 1;
+    FOREACH v_pu_id IN ARRAY v_available LOOP
+        EXIT WHEN v_i > 4;
+        -- Не дублируем в рамках четвёрки (v_available уже уникален по id)
+        v_chosen := array_append(v_chosen, v_pu_id);
+        v_i := v_i + 1;
+    END LOOP;
+
+    IF array_length(v_chosen, 1) < 1 THEN
+        RAISE EXCEPTION 'Нет доступных усилений для реролла';
+    END IF;
+
+    -- Удаляем старые слоты (они заменяются новыми)
+    DELETE FROM shop_slots WHERE shop_id = p_shop_id;
+
+    -- Увеличиваем счётчик реролов
+    UPDATE shops SET offset_value = offset_value + 1 WHERE id = p_shop_id;
+
+    -- Создаём новые слоты
+    FOR v_i IN 1..array_length(v_chosen, 1) LOOP
+        INSERT INTO shop_slots (shop_id, power_up_id, slot_index, status, cost)
+        VALUES (
+            p_shop_id,
+            v_chosen[v_i],
+            v_i - 1,
+            'available',
+            (SELECT pu.cost FROM power_ups pu WHERE pu.id = v_chosen[v_i])
+        );
+    END LOOP;
+
+    -- Списать стоимость реролла
+    UPDATE game_participants gp2
+    SET balance     = gp2.balance - v_cost,
+        total_spent = gp2.total_spent + v_cost
+    WHERE gp2.game_id = p_game_id AND gp2.user_id = p_user_id;
+
+    SELECT gp3.position, gp3.balance, gp3.moves_made, gp3.total_spent, gp3.total_earned
+    INTO v_pos, v_bal, v_moves, v_spent, v_earned
+    FROM game_participants gp3
+    WHERE gp3.game_id = p_game_id AND gp3.user_id = p_user_id;
+
+    RETURN QUERY SELECT v_pos, v_bal, v_moves, v_spent, v_earned;
+END;
+$$ LANGUAGE plpgsql;
+
+-- -------------------------------------------------------------------
+-- БЛОК 8: Продажа усилений
+-- -------------------------------------------------------------------
+
+-- Продать усиление из инвентаря: вернуть половину стоимости, удалить из инвентаря.
+DROP FUNCTION IF EXISTS sell_power_up(UUID, UUID, UUID);
+CREATE OR REPLACE FUNCTION sell_power_up(
+    p_game_id    UUID,
+    p_user_id    UUID,
+    p_power_up_id UUID
+)
+RETURNS TABLE (
+    "position"   INT,
+    balance      BIGINT,
+    moves_made   INT,
+    total_spent  BIGINT,
+    total_earned BIGINT
+) AS $$
+DECLARE
+    v_cost   BIGINT;
+    v_refund BIGINT;
+    v_qty    INT;
+    v_pos    INT;
+    v_bal    BIGINT;
+    v_moves  INT;
+    v_spent  BIGINT;
+    v_earned BIGINT;
+BEGIN
+    SELECT pu.cost INTO v_cost
+    FROM power_ups pu WHERE pu.id = p_power_up_id;
+
+    v_refund := v_cost / 2;
+
+    SELECT pi.quantity INTO v_qty
+    FROM player_inventory pi
+    WHERE pi.game_id = p_game_id
+      AND pi.user_id = p_user_id
+      AND pi.power_up_id = p_power_up_id;
+
+    IF v_qty IS NULL OR v_qty < 1 THEN
+        RAISE EXCEPTION 'Усиление не найдено в инвентаре';
+    END IF;
+
+    -- Удаляем одну единицу или весь стак
+    IF v_qty <= 1 THEN
+        DELETE FROM player_inventory
+        WHERE game_id = p_game_id
+          AND user_id = p_user_id
+          AND power_up_id = p_power_up_id;
+    ELSE
+        UPDATE player_inventory
+        SET quantity = quantity - 1
+        WHERE game_id = p_game_id
+          AND user_id = p_user_id
+          AND power_up_id = p_power_up_id;
+    END IF;
+
+    -- Возвращаем деньги
+    UPDATE game_participants gp2
+    SET balance      = gp2.balance + v_refund,
+        total_earned = gp2.total_earned + v_refund
+    WHERE gp2.game_id = p_game_id AND gp2.user_id = p_user_id;
+
+    SELECT gp3.position, gp3.balance, gp3.moves_made, gp3.total_spent, gp3.total_earned
+    INTO v_pos, v_bal, v_moves, v_spent, v_earned
+    FROM game_participants gp3
+    WHERE gp3.game_id = p_game_id AND gp3.user_id = p_user_id;
+
+    RETURN QUERY SELECT v_pos, v_bal, v_moves, v_spent, v_earned;
+END;
+$$ LANGUAGE plpgsql;
+
+-- -------------------------------------------------------------------
+-- БЛОК 9: Проверка банкротства
+-- -------------------------------------------------------------------
+
+DROP FUNCTION IF EXISTS get_all_balances(UUID);
+CREATE OR REPLACE FUNCTION get_all_balances(p_game_id UUID)
+RETURNS TABLE (
+    user_id   UUID,
+    balance   BIGINT,
+    user_type TEXT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT gp.user_id, gp.balance, u.type::TEXT
+    FROM game_participants gp
+    JOIN users u ON u.id = gp.user_id
+    WHERE gp.game_id = p_game_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- -------------------------------------------------------------------
+-- БЛОК 10: Налог
+-- -------------------------------------------------------------------
+
+DROP FUNCTION IF EXISTS pay_tax(UUID, UUID);
+CREATE OR REPLACE FUNCTION pay_tax(
+    p_game_id UUID,
+    p_user_id UUID
+)
+RETURNS TABLE (
+    "position"   INT,
+    balance      BIGINT,
+    moves_made   INT,
+    total_spent  BIGINT,
+    total_earned BIGINT
+) AS $$
+DECLARE
+    v_bal    BIGINT;
+    v_tax    BIGINT;
+    v_pos    INT;
+    v_moves  INT;
+    v_spent  BIGINT;
+    v_earned BIGINT;
+BEGIN
+    SELECT gp.balance INTO v_bal
+    FROM game_participants gp
+    WHERE gp.game_id = p_game_id AND gp.user_id = p_user_id;
+
+    v_tax := 100 + CEIL(v_bal * 0.05);
+
+    UPDATE game_participants gp2
+    SET balance     = gp2.balance - v_tax,
+        total_spent = gp2.total_spent + v_tax
+    WHERE gp2.game_id = p_game_id AND gp2.user_id = p_user_id;
+
+    SELECT gp3.position, gp3.balance, gp3.moves_made, gp3.total_spent, gp3.total_earned
+    INTO v_pos, v_bal, v_moves, v_spent, v_earned
+    FROM game_participants gp3
+    WHERE gp3.game_id = p_game_id AND gp3.user_id = p_user_id;
+
+    RETURN QUERY SELECT v_pos, v_bal, v_moves, v_spent, v_earned;
 END;
 $$ LANGUAGE plpgsql;

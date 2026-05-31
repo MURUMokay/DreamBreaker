@@ -41,8 +41,26 @@ const WINDOW_MODES: &[WindowMode] = &[
 ];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnPhase {
-    WaitingRoll, // ждём броска кубика
-    Rolled,      // кубик брошен, игрок переместился — можно завершить ход
+    WaitingRoll,   // ждём броска кубика
+    Rolled,        // кубик брошен, игрок переместился — можно завершить ход
+    WaitingAction, // ждём действия на клетке (купить/пропустить/аренда)
+}
+#[derive(Debug, Clone)]
+enum CellAction {
+    CanBuy {
+        cell_index: i32,
+        cost: i64,
+    },
+    MustPayRent {
+        cell_index: i32,
+        rent: i64,
+        owner: String,
+    },
+    Tax, // <- добавить
+    Info(String),
+    Shop {
+        shop_id: Uuid,
+    },
 }
 // ─────────────────────────────────────────────
 // State
@@ -78,7 +96,9 @@ struct DreamBreaker {
     game_menu_open: bool,
     dice_roll: Option<(u8, u8)>,
     local_player_pos: i32,
-    turn_phase: TurnPhase, // фаза хода
+    turn_phase: TurnPhase,           // фаза хода
+    cell_action: Option<CellAction>, // текущее действие на клетке
+    shop_slots: Vec<db::ShopSlot>,   // текущие слоты открытого магазина
 
     // Экран завершения
     game_result: Option<db::GameResult>,
@@ -114,6 +134,8 @@ impl Default for DreamBreaker {
             active_game_id: None,
             game_rules: None,
             player_state: None,
+            cell_action: None,
+            shop_slots: Vec::new(),
             local_player_pos: 0,
             board_cells: vec![],
             inventory: vec![],
@@ -192,6 +214,21 @@ enum Message {
     TurnSaved(Result<db::ParticipantState, db::DbError>),
     ContinueGame, // загрузить последнюю игру напрямую
     BalancesLoaded(Result<Vec<(Uuid, i64, String)>, db::DbError>),
+    BuyProperty,
+    SkipAction,
+    PropertyBought(Result<db::ParticipantState, db::DbError>),
+    RentPaid(Result<db::ParticipantState, db::DbError>),
+    BoardReloaded(Result<Vec<db::BoardCell>, db::DbError>),
+    OpenShop(Uuid),
+    ShopSlotsLoaded(Result<Vec<db::ShopSlot>, db::DbError>),
+    BuyShopSlot(Uuid),
+    ShopSlotBought(Result<db::ParticipantState, db::DbError>),
+    RerollShop(Uuid),
+    ShopRerolled(Result<db::ParticipantState, db::DbError>),
+    TaxPaid(Result<db::ParticipantState, db::DbError>),
+    InventoryReloaded(Result<Vec<db::InventoryItem>, db::DbError>),
+    SellPowerUp(Uuid),
+    PowerUpSold(Result<db::ParticipantState, db::DbError>),
 
     // Настройки
     SetWindowMode(WindowMode),
@@ -821,15 +858,10 @@ impl DreamBreaker {
                 if self.turn_phase != TurnPhase::WaitingRoll {
                     return Task::none();
                 }
-                // Блокируем если ходы кончились
                 if let (Some(state), Some(rules)) = (&self.player_state, &self.game_rules) {
                     if state.moves_made >= rules.max_turns {
                         return Task::none();
                     }
-                }
-                // Бросать кубик можно только в фазе WaitingRoll
-                if self.turn_phase != TurnPhase::WaitingRoll {
-                    return Task::none();
                 }
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let seed = SystemTime::now()
@@ -841,12 +873,70 @@ impl DreamBreaker {
                 self.dice_roll = Some((d1, d2));
                 self.local_player_pos = (self.local_player_pos + (d1 + d2) as i32) % 40;
                 self.turn_phase = TurnPhase::Rolled;
+                self.shop_slots = Vec::new();
+
+                // Определяем действие на новой клетке
+                let new_pos = self.local_player_pos;
+                let user_id = self.current_user.as_ref().map(|(id, _)| *id);
+                let cell = self
+                    .board_cells
+                    .iter()
+                    .find(|c| c.cell_index == new_pos)
+                    .cloned();
+
+                self.cell_action = match &cell {
+                    Some(c) if c.cell_type == "property" => {
+                        let cost = c.purchase_cost.unwrap_or(0);
+                        let rent = c.rent_cost.unwrap_or(0);
+                        if c.owner_user_id.is_none() {
+                            Some(CellAction::CanBuy {
+                                cell_index: new_pos,
+                                cost,
+                            })
+                        } else if c.owner_user_id == user_id {
+                            Some(CellAction::Info("Ваша собственность".to_string()))
+                        } else {
+                            let owner = c.prop_name.clone().unwrap_or_default();
+                            Some(CellAction::MustPayRent {
+                                cell_index: new_pos,
+                                rent,
+                                owner,
+                            })
+                        }
+                    }
+                    Some(c) if c.cell_type == "tax" => Some(CellAction::Tax),
+                    Some(c) if c.cell_type == "shop" => {
+                        if let Some(shop_id) = c.shop_id {
+                            Some(CellAction::Shop { shop_id })
+                        } else {
+                            Some(CellAction::Info("Магазин".to_string()))
+                        }
+                    }
+                    _ => None,
+                };
+
+                // Если магазин — сразу загружаем слоты
+                if let Some(CellAction::Shop { shop_id }) = &self.cell_action {
+                    let shop_id = *shop_id;
+                    let game_id = match self.active_game_id {
+                        Some(id) => id,
+                        None => return Task::none(),
+                    };
+                    let uid = match user_id {
+                        Some(id) => id,
+                        None => return Task::none(),
+                    };
+                    if let Some(pool) = self.pool.clone() {
+                        return Task::perform(
+                            async move { db::get_shop_slots(&pool, shop_id, game_id, uid).await },
+                            Message::ShopSlotsLoaded,
+                        );
+                    }
+                }
+
                 Task::none()
             }
-            Message::EndTurn => {
-                if self.turn_phase != TurnPhase::Rolled {
-                    return Task::none();
-                }
+            Message::OpenShop(shop_id) => {
                 let game_id = match self.active_game_id {
                     Some(id) => id,
                     None => return Task::none(),
@@ -855,27 +945,239 @@ impl DreamBreaker {
                     Some(u) => u.clone(),
                     None => return Task::none(),
                 };
-                let new_pos = self.local_player_pos;
-                if let Some(pool) = self.pool.clone() {
-                    Task::perform(
-                        async move { db::commit_player_move(&pool, game_id, user_id, new_pos).await },
-                        Message::TurnSaved,
-                    )
-                } else {
-                    Task::none()
-                }
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                Task::perform(
+                    async move { db::get_shop_slots(&pool, shop_id, game_id, user_id).await },
+                    Message::ShopSlotsLoaded,
+                )
             }
-            Message::TurnSaved(Ok(new_state)) => {
-                self.player_state = Some(new_state.clone());
-                self.turn_phase = TurnPhase::WaitingRoll;
-                self.dice_roll = None;
-                self.status = "Ход завершён".to_string();
-
-                // Загружаем балансы всех участников для проверки банкротства
+            Message::ShopSlotsLoaded(Ok(slots)) => {
+                self.shop_slots = slots;
+                Task::none()
+            }
+            Message::ShopSlotsLoaded(Err(e)) => {
+                self.status = format!("Ошибка загрузки магазина: {}", e.0);
+                Task::none()
+            }
+            Message::BuyShopSlot(slot_id) => {
                 let game_id = match self.active_game_id {
                     Some(id) => id,
                     None => return Task::none(),
                 };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                Task::perform(
+                    async move { db::buy_shop_slot(&pool, slot_id, game_id, user_id).await },
+                    Message::ShopSlotBought,
+                )
+            }
+            Message::ShopSlotBought(Ok(new_state)) => {
+                self.player_state = Some(new_state);
+                self.status = "Усиление куплено".to_string();
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                let shop_id = match &self.cell_action {
+                    Some(CellAction::Shop { shop_id }) => *shop_id,
+                    _ => return Task::none(),
+                };
+                let pool2 = pool.clone();
+                Task::batch([
+                    Task::perform(
+                        async move { db::get_shop_slots(&pool, shop_id, game_id, user_id).await },
+                        Message::ShopSlotsLoaded,
+                    ),
+                    Task::perform(
+                        async move { db::get_player_inventory(&pool2, game_id, user_id).await },
+                        Message::InventoryReloaded,
+                    ),
+                ])
+            }
+            Message::ShopSlotBought(Err(e)) => {
+                self.status = format!("Ошибка покупки: {}", e.0);
+                Task::none()
+            }
+            Message::InventoryReloaded(Ok(items)) => {
+                self.inventory = items;
+                Task::none()
+            }
+            Message::InventoryReloaded(Err(e)) => {
+                self.status = format!("Ошибка обновления инвентаря: {}", e.0);
+                Task::none()
+            }
+            Message::SellPowerUp(power_up_id) => {
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                Task::perform(
+                    async move { db::sell_power_up(&pool, game_id, user_id, power_up_id).await },
+                    Message::PowerUpSold,
+                )
+            }
+            Message::PowerUpSold(Ok(new_state)) => {
+                self.player_state = Some(new_state);
+                self.status = "Усиление продано".to_string();
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                Task::perform(
+                    async move { db::get_player_inventory(&pool, game_id, user_id).await },
+                    Message::InventoryReloaded,
+                )
+            }
+            Message::PowerUpSold(Err(e)) => {
+                self.status = format!("Ошибка продажи: {}", e.0);
+                Task::none()
+            }
+            Message::RerollShop(shop_id) => {
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                Task::perform(
+                    async move { db::reroll_shop(&pool, shop_id, game_id, user_id).await },
+                    Message::ShopRerolled,
+                )
+            }
+            Message::ShopRerolled(Ok(new_state)) => {
+                self.player_state = Some(new_state);
+                self.status = "Магазин обновлён".to_string();
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                let shop_id = match &self.cell_action {
+                    Some(CellAction::Shop { shop_id }) => *shop_id,
+                    _ => return Task::none(),
+                };
+                Task::perform(
+                    async move { db::get_shop_slots(&pool, shop_id, game_id, user_id).await },
+                    Message::ShopSlotsLoaded,
+                )
+            }
+            Message::ShopRerolled(Err(e)) => {
+                self.status = format!("Ошибка реролла: {}", e.0);
+                Task::none()
+            }
+            Message::EndTurn => {
+                if self.turn_phase != TurnPhase::Rolled {
+                    return Task::none();
+                }
+                self.shop_slots = Vec::new();
+
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+
+                // Оплата аренды
+                if let Some(CellAction::MustPayRent { cell_index, .. }) = &self.cell_action.clone()
+                {
+                    let ci = *cell_index;
+                    self.cell_action = None;
+                    return Task::perform(
+                        async move { db::pay_rent(&pool, game_id, user_id, ci).await },
+                        Message::RentPaid,
+                    );
+                }
+
+                // Оплата налога
+                if let Some(CellAction::Tax) = &self.cell_action {
+                    self.cell_action = None;
+                    return Task::perform(
+                        async move { db::pay_tax(&pool, game_id, user_id).await },
+                        Message::TaxPaid,
+                    );
+                }
+
+                self.cell_action = None;
+                let new_pos = self.local_player_pos;
+                Task::perform(
+                    async move { db::commit_player_move(&pool, game_id, user_id, new_pos).await },
+                    Message::TurnSaved,
+                )
+            }
+            Message::TurnSaved(Ok(new_state)) => {
+                let old_balance = self.player_state.as_ref().map(|s| s.balance).unwrap_or(0);
+                self.player_state = Some(new_state.clone());
+                self.turn_phase = TurnPhase::WaitingRoll;
+                self.dice_roll = None;
+
+                let balance_diff = new_state.balance - old_balance;
+                self.status = if balance_diff >= 400 {
+                    format!("Ход завершён. Вы встали на СТАРТ! +400")
+                } else if balance_diff >= 200 {
+                    format!("Ход завершён. Вы прошли СТАРТ! +200")
+                } else {
+                    "Ход завершён".to_string()
+                };
+
+                let game_id = match self.active_game_id {
+                    // <- добавить
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+
                 if let Some(pool) = self.pool.clone() {
                     return Task::perform(
                         async move { db::get_all_balances(&pool, game_id).await },
@@ -950,6 +1252,81 @@ impl DreamBreaker {
                 self.status = format!("Ошибка загрузки балансов: {}", e.0);
                 Task::none()
             }
+            Message::BuyProperty => {
+                let action = match &self.cell_action {
+                    Some(CellAction::CanBuy { cell_index, .. }) => *cell_index,
+                    _ => return Task::none(),
+                };
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                let (user_id, _) = match &self.current_user {
+                    Some(u) => u.clone(),
+                    None => return Task::none(),
+                };
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                self.cell_action = None;
+                Task::perform(
+                    async move { db::buy_property(&pool, game_id, user_id, action).await },
+                    Message::PropertyBought,
+                )
+            }
+            Message::SkipAction => {
+                // Если это аренда которую нельзя пропустить — всё равно платим при EndTurn
+                // Если можно пропустить (не купить) — просто сбрасываем
+                self.cell_action = None;
+                Task::none()
+            }
+            Message::PropertyBought(Ok(new_state)) => {
+                self.player_state = Some(new_state);
+                self.status = "Собственность куплена".to_string();
+                // Перезагружаем клетки чтобы обновить владельца
+                let game_id = match self.active_game_id {
+                    Some(id) => id,
+                    None => return Task::none(),
+                };
+                let pool = match self.pool.clone() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                Task::perform(
+                    async move { db::get_board_cells(&pool, game_id).await },
+                    Message::BoardReloaded,
+                )
+            }
+            Message::PropertyBought(Err(e)) => {
+                self.status = format!("Ошибка покупки: {}", e.0);
+                Task::none()
+            }
+            Message::RentPaid(Ok(new_state)) => {
+                self.player_state = Some(new_state);
+                self.status = "Аренда уплачена".to_string();
+                self.cell_action = None;
+                Task::none()
+            }
+            Message::RentPaid(Err(e)) => {
+                self.status = format!("Ошибка аренды: {}", e.0);
+                Task::none()
+            }
+            Message::TaxPaid(Ok(new_state)) => {
+                self.player_state = Some(new_state);
+                self.status = "Налог уплачен".to_string();
+                self.cell_action = None;
+                Task::none()
+            }
+            Message::TaxPaid(Err(e)) => {
+                self.status = format!("Ошибка налога: {}", e.0);
+                Task::none()
+            }
+            Message::BoardReloaded(Ok(cells)) => {
+                self.board_cells = cells;
+                Task::none()
+            }
+            Message::BoardReloaded(Err(_)) => Task::none(),
         }
     }
 
@@ -1547,30 +1924,68 @@ impl DreamBreaker {
         let turns_left = (rules.max_turns - state.moves_made).max(0);
 
         let slot_size = self.s(56.0);
+        let btn_size = self.s(56.0);
+        let fs_inv = self.ts(10);
+
+        let short_label = |item: &db::InventoryItem| -> String {
+            let val = item
+                .effect
+                .get("value")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            match item
+                .effect
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+            {
+                "flat_base" => format!("+{}\nБаза", val),
+                "percent_bonus" => format!("+{}%\nАренда", val),
+                "flat_final" => format!("+{}\nИтог", val),
+                _ => item.name.chars().take(8).collect(),
+            }
+        };
+
         let mut inv_row = row![].spacing(self.s(3.0) as u16);
         for slot in 0..5usize {
             let cell: Element<'_, Message> = if slot < self.inventory.len() {
                 let item = &self.inventory[slot];
-                container(text(item.name.chars().take(8).collect::<String>()).size(self.ts(10)))
-                    .width(Length::Fixed(slot_size))
-                    .height(Length::Fixed(slot_size))
-                    .padding(self.s(3.0) as u16)
-                    .style(|_theme| container::Style {
-                        background: Some(Background::Color(Color::from_rgba(0.2, 0.2, 0.3, 0.88))),
-                        border: iced::Border {
-                            color: Color::from_rgba(1.0, 1.0, 1.0, 0.25),
-                            width: 1.0,
-                            radius: 4.0.into(),
-                        },
-                        ..Default::default()
-                    })
-                    .into()
+                let label = short_label(item);
+                let pu_id = item.power_up_id;
+                column![
+                    container(text(label).size(fs_inv))
+                        .width(Length::Fixed(slot_size))
+                        .height(Length::Fixed(slot_size))
+                        .padding(self.s(3.0) as u16)
+                        .align_x(iced::alignment::Horizontal::Center)
+                        .align_y(iced::alignment::Vertical::Center)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(
+                                0.15, 0.2, 0.4, 0.9
+                            ))),
+                            border: iced::Border {
+                                color: Color::from_rgba(0.4, 0.6, 1.0, 0.5),
+                                width: 1.0,
+                                radius: 4.0.into(),
+                            },
+                            ..Default::default()
+                        }),
+                    button(text("Продать").size(self.ts(9)))
+                        .on_press(Message::SellPowerUp(pu_id))
+                        .width(Length::Fixed(btn_size))
+                        .padding(self.s(2.0) as u16),
+                ]
+                .align_x(Alignment::Center)
+                .spacing(self.s(2.0) as u16)
+                .into()
             } else {
                 container(text("—").size(self.ts(13)))
                     .width(Length::Fixed(slot_size))
                     .height(Length::Fixed(slot_size))
                     .padding(self.s(3.0) as u16)
-                    .style(|_theme| container::Style {
+                    .align_x(iced::alignment::Horizontal::Center)
+                    .align_y(iced::alignment::Vertical::Center)
+                    .style(|_| container::Style {
                         background: Some(Background::Color(Color::from_rgba(0.1, 0.1, 0.15, 0.72))),
                         border: iced::Border {
                             color: Color::from_rgba(1.0, 1.0, 1.0, 0.1),
@@ -1671,15 +2086,255 @@ impl DreamBreaker {
         .spacing(self.s(6.0) as u16)
         .align_x(Alignment::Center)
         .into();
+        // Блок действия на клетке
+        let action_block: Option<Element<'_, Message>> = match &self.cell_action {
+            Some(CellAction::CanBuy { cost, .. }) => Some(
+                container(
+                    column![
+                        text(format!("Свободная собственность! Купить за {}?", cost))
+                            .size(self.ts(14)),
+                        Space::with_height(self.s(6.0)),
+                        button(text("Купить").size(self.ts(14)))
+                            .on_press(Message::BuyProperty)
+                            .padding(self.s(8.0) as u16)
+                            .width(Length::Fixed(self.s(120.0))),
+                    ]
+                    .align_x(Alignment::Center)
+                    .spacing(self.s(4.0) as u16)
+                    .padding(self.s(10.0) as u16),
+                )
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color::from_rgba(0.1, 0.3, 0.1, 0.9))),
+                    border: iced::Border {
+                        color: Color::from_rgba(0.3, 0.8, 0.3, 0.8),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into(),
+            ),
+            Some(CellAction::Shop { shop_id }) => {
+                let shop_id = *shop_id;
+                let reroll_count = self.shop_slots.first().map(|s| s.reroll_count).unwrap_or(0);
+                let reroll_cost = 50 + 15 * reroll_count as i64;
 
-        let center_panel: Element<'_, Message> = column![
+                let mut slots_row = row![].spacing(self.s(8.0) as u16);
+                for slot in &self.shop_slots {
+                    if slot.status == "rerolled" {
+                        continue;
+                    }
+                    let slot_id = slot.slot_id;
+                    let can_buy = slot.status == "available" && !slot.already_own;
+                    let btn: Element<'_, Message> = if slot.status == "sold" {
+                        container(text("Продано").size(self.ts(11)))
+                            .width(Length::Fixed(self.s(120.0)))
+                            .height(Length::Fixed(self.s(24.0)))
+                            .align_x(iced::alignment::Horizontal::Center)
+                            .align_y(iced::alignment::Vertical::Center)
+                            .style(|_| container::Style {
+                                background: Some(Background::Color(Color::from_rgba(
+                                    0.3, 0.3, 0.3, 0.5,
+                                ))),
+                                ..Default::default()
+                            })
+                            .into()
+                    } else if slot.already_own {
+                        container(text("Уже есть").size(self.ts(11)))
+                            .width(Length::Fixed(self.s(120.0)))
+                            .height(Length::Fixed(self.s(24.0)))
+                            .align_x(iced::alignment::Horizontal::Center)
+                            .align_y(iced::alignment::Vertical::Center)
+                            .style(|_| container::Style {
+                                background: Some(Background::Color(Color::from_rgba(
+                                    0.3, 0.3, 0.3, 0.5,
+                                ))),
+                                ..Default::default()
+                            })
+                            .into()
+                    } else {
+                        let inv_full = self.inventory.iter().map(|i| i.quantity).sum::<i32>() >= 5;
+
+                        if inv_full {
+                            container(text("Инвентарь полон").size(self.ts(11)))
+                                .width(Length::Fixed(self.s(120.0)))
+                                .height(Length::Fixed(self.s(24.0)))
+                                .align_x(iced::alignment::Horizontal::Center)
+                                .align_y(iced::alignment::Vertical::Center)
+                                .style(|_| container::Style {
+                                    background: Some(Background::Color(Color::from_rgba(
+                                        0.3, 0.3, 0.3, 0.5,
+                                    ))),
+                                    ..Default::default()
+                                })
+                                .into()
+                        } else {
+                            button(text(format!("Купить {}", slot.cost)).size(self.ts(11)))
+                                .on_press(Message::BuyShopSlot(slot_id))
+                                .width(Length::Fixed(self.s(120.0)))
+                                .padding(self.s(4.0) as u16)
+                                .into()
+                        }
+                    };
+
+                    let slot_col: Element<'_, Message> = container(
+                        column![
+                            text(slot.name.clone()).size(self.ts(12)),
+                            Space::with_height(self.s(2.0)),
+                            text(slot.description.chars().take(40).collect::<String>())
+                                .size(self.ts(10)),
+                            Space::with_height(self.s(4.0)),
+                            btn,
+                        ]
+                        .align_x(Alignment::Center)
+                        .spacing(self.s(2.0) as u16)
+                        .padding(self.s(6.0) as u16),
+                    )
+                    .width(Length::Fixed(self.s(130.0)))
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(Color::from_rgba(
+                            0.15, 0.15, 0.25, 0.95,
+                        ))),
+                        border: iced::Border {
+                            color: Color::from_rgba(0.4, 0.4, 0.7, 0.6),
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .into();
+                    slots_row = slots_row.push(slot_col);
+                }
+
+                // Если слоты ещё не загружены — загружаем
+                let content: Element<'_, Message> = if self.shop_slots.is_empty() {
+                    column![
+                        text("Магазин усилений").size(self.ts(15)),
+                        button(text("Открыть магазин").size(self.ts(13)))
+                            .on_press(Message::OpenShop(shop_id))
+                            .padding(self.s(8.0) as u16),
+                    ]
+                    .align_x(Alignment::Center)
+                    .spacing(self.s(6.0) as u16)
+                    .padding(self.s(10.0) as u16)
+                    .into()
+                } else {
+                    column![
+                        text("Магазин усилений").size(self.ts(15)),
+                        Space::with_height(self.s(6.0)),
+                        slots_row,
+                        Space::with_height(self.s(6.0)),
+                        button(
+                            text(format!("Обновить ассортимент ({})", reroll_cost))
+                                .size(self.ts(12))
+                        )
+                        .on_press(Message::RerollShop(shop_id))
+                        .padding(self.s(6.0) as u16),
+                    ]
+                    .align_x(Alignment::Center)
+                    .spacing(self.s(4.0) as u16)
+                    .padding(self.s(10.0) as u16)
+                    .into()
+                };
+
+                Some(
+                    container(content)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(
+                                0.05, 0.05, 0.2, 0.95,
+                            ))),
+                            border: iced::Border {
+                                color: Color::from_rgba(0.3, 0.3, 0.9, 0.8),
+                                width: 1.0,
+                                radius: 8.0.into(),
+                            },
+                            ..Default::default()
+                        })
+                        .into(),
+                )
+            }
+            Some(CellAction::MustPayRent { rent, owner, .. }) => Some(
+                container(
+                    column![
+                        text(format!("Чужая собственность: {}", owner)).size(self.ts(14)),
+                        text(format!(
+                            "Аренда будет списана при завершении хода: {}",
+                            rent
+                        ))
+                        .size(self.ts(13)),
+                    ]
+                    .align_x(Alignment::Center)
+                    .spacing(self.s(4.0) as u16)
+                    .padding(self.s(10.0) as u16),
+                )
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color::from_rgba(0.3, 0.1, 0.1, 0.9))),
+                    border: iced::Border {
+                        color: Color::from_rgba(0.8, 0.3, 0.3, 0.8),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into(),
+            ),
+            Some(CellAction::Info(msg)) => Some(
+                container(text(msg.clone()).size(self.ts(14)))
+                    .padding(self.s(10.0) as u16)
+                    .style(|_theme| container::Style {
+                        background: Some(Background::Color(Color::from_rgba(0.1, 0.1, 0.3, 0.9))),
+                        border: iced::Border {
+                            color: Color::from_rgba(0.3, 0.3, 0.8, 0.8),
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .into(),
+            ),
+            Some(CellAction::Tax) => {
+                let tax = if let Some(s) = &self.player_state {
+                    100 + (s.balance as f64 * 0.05).ceil() as i64
+                } else {
+                    100
+                };
+                Some(
+                    container(
+                        text(format!("Налог! При завершении хода спишется: {}", tax))
+                            .size(self.ts(14)),
+                    )
+                    .padding(self.s(10.0) as u16)
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(Color::from_rgba(0.3, 0.1, 0.1, 0.9))),
+                        border: iced::Border {
+                            color: Color::from_rgba(0.8, 0.3, 0.3, 0.8),
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+            }
+            None => None,
+        };
+
+        // В center_panel добавить action_block
+        let mut center_col = column![
             container(stats_panel).padding(0),
-            Space::with_height(self.s(14.0)),
-            dice_block,
+            Space::with_height(self.s(10.0)),
         ]
         .align_x(Alignment::Center)
-        .spacing(0)
-        .into();
+        .spacing(0);
+
+        if let Some(action) = action_block {
+            center_col = center_col.push(action);
+            center_col = center_col.push(Space::with_height(self.s(8.0)));
+        }
+
+        center_col = center_col.push(dice_block);
+
+        let center_panel: Element<'_, Message> = center_col.into();
 
         let panel_overlay: Element<'_, Message> = container(center_panel)
             .width(Length::Fill)
@@ -1784,70 +2439,105 @@ impl DreamBreaker {
                             .map(|_| text("*").size(fs_sm))
                             .unwrap_or_else(|| text(" ").size(fs_sm));
 
-                        let cell_body: Element<'_, Message> = container(
+                        // Цвет группы собственности
+                        // Раскладка: слоты 1,2,3 = цвет A стороны; 6,7,8,9 = цвет B
+                        // idx % 10: позиция на стороне
+                        let color_stripe: Option<Color> =
+                            if cell_map.get(&idx).map(|c| c.cell_type.as_str()) == Some("property")
+                            {
+                                let pos_on_side = idx % 10;
+                                let side_num = idx / 10; // 0=низ,1=право,2=верх,3=лево
+                                let group = if pos_on_side <= 3 {
+                                    side_num * 2 // нечётный цвет стороны
+                                } else {
+                                    side_num * 2 + 1 // чётный цвет стороны
+                                };
+                                Some(match group {
+                                    0 => Color::from_rgb(0.53, 0.81, 0.98), // голубой
+                                    1 => Color::from_rgb(0.58, 0.0, 0.83),  // фиолетовый
+                                    2 => Color::from_rgb(1.0, 0.6, 0.2),    // оранжевый
+                                    3 => Color::from_rgb(1.0, 0.0, 0.0),    // красный
+                                    4 => Color::from_rgb(1.0, 1.0, 0.0),    // жёлтый
+                                    5 => Color::from_rgb(0.13, 0.55, 0.13), // зелёный
+                                    6 => Color::from_rgb(0.0, 0.0, 0.8),    // синий
+                                    _ => Color::from_rgb(0.55, 0.27, 0.07), // коричневый
+                                })
+                            } else {
+                                None
+                            };
+
+                        let stripe_size = (cell_size * 0.22).max(4.0);
+
+                        let cell_content: Element<'_, Message> =
                             column![text(label).size(fs), text(sublabel).size(fs_sm), owner_mark,]
                                 .align_x(Alignment::Center)
                                 .spacing(1)
-                                .padding(2),
-                        )
-                        .width(Length::Fixed(cell_size))
-                        .height(Length::Fixed(cell_size))
-                        .style(move |_theme| container::Style {
-                            background: if is_player {
-                                Some(Background::Color(Color::from_rgba(0.8, 0.7, 0.0, 0.35)))
-                            } else {
-                                None
-                            },
-                            ..Default::default()
-                        })
-                        .into();
+                                .padding(2)
+                                .into();
 
-                        if !is_player {
-                            cell_body
-                        } else {
-                            let icon: Element<'_, Message> =
-                                svg(std::path::Path::new("assets/player_icon.svg"))
-                                    .width(Length::Fixed(icon_size))
-                                    .height(Length::Fixed(icon_size))
+                        // Цветная полоска — со стороны поля (снаружи)
+                        let cell_body: Element<'_, Message> = if let Some(color) = color_stripe {
+                            let stripe: Element<'_, Message> =
+                                container(Space::new(Length::Fill, Length::Fill))
+                                    .width(match side {
+                                        "left" | "right" => Length::Fixed(stripe_size),
+                                        _ => Length::Fill,
+                                    })
+                                    .height(match side {
+                                        "top" | "bottom" => Length::Fixed(stripe_size),
+                                        _ => Length::Fill,
+                                    })
+                                    .style(move |_theme| container::Style {
+                                        background: Some(Background::Color(color)),
+                                        ..Default::default()
+                                    })
                                     .into();
 
-                            // Смещаем иконку через Space внутри row/column,
-                            // всё это в stack поверх клетки — размер stack = cell_size
-                            let icon_layer: Element<'_, Message> = match side {
-                                "bottom" => {
-                                    let spacer_x = Space::with_width(
-                                        (cell_size / 2.0 - icon_size / 2.0).max(0.0),
-                                    );
-                                    let spacer_y = Space::with_height(cell_size);
-                                    column![spacer_y, row![spacer_x, icon]].into()
-                                }
-                                "right" => {
-                                    let spacer_x = Space::with_width(cell_size);
-                                    let spacer_y = Space::with_height(
-                                        (cell_size / 2.0 - icon_size / 2.0).max(0.0),
-                                    );
-                                    row![spacer_x, column![spacer_y, icon]].into()
-                                }
-                                "top" => {
-                                    let spacer_x = Space::with_width(
-                                        (cell_size / 2.0 - icon_size / 2.0).max(0.0),
-                                    );
-                                    row![spacer_x, icon].into()
-                                }
-                                _ => {
-                                    // left
-                                    let spacer_y = Space::with_height(
-                                        (cell_size / 2.0 - icon_size / 2.0).max(0.0),
-                                    );
-                                    column![spacer_y, icon].into()
-                                }
+                            let inner: Element<'_, Message> = container(cell_content)
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .into();
+
+                            // Полоска с внешней стороны клетки
+                            let layered: Element<'_, Message> = match side {
+                                "bottom" => column![stripe, inner].spacing(0).into(),
+                                "top" => column![inner, stripe].spacing(0).into(),
+                                "right" => row![stripe, inner].spacing(0).into(),
+                                _ => row![inner, stripe].spacing(0).into(), // left
                             };
 
-                            stack![cell_body, icon_layer]
+                            container(layered)
                                 .width(Length::Fixed(cell_size))
                                 .height(Length::Fixed(cell_size))
+                                .style(move |_theme| container::Style {
+                                    background: if is_player {
+                                        Some(Background::Color(Color::from_rgba(
+                                            0.8, 0.7, 0.0, 0.35,
+                                        )))
+                                    } else {
+                                        None
+                                    },
+                                    ..Default::default()
+                                })
                                 .into()
-                        }
+                        } else {
+                            container(cell_content)
+                                .width(Length::Fixed(cell_size))
+                                .height(Length::Fixed(cell_size))
+                                .style(move |_theme| container::Style {
+                                    background: if is_player {
+                                        Some(Background::Color(Color::from_rgba(
+                                            0.8, 0.7, 0.0, 0.35,
+                                        )))
+                                    } else {
+                                        None
+                                    },
+                                    ..Default::default()
+                                })
+                                .into()
+                        };
+
+                        cell_body
                     }
                 };
                 board_row = board_row.push(cell_elem);
