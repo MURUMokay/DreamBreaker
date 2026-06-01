@@ -91,6 +91,20 @@ pub struct BoardCell {
     pub owner_user_id: Option<Uuid>,
     pub shop_id: Option<Uuid>,
     pub refresh_cost: Option<i64>,
+    // upgrades_count намеренно отсутствует — вычисляется в UI из player_properties
+}
+
+/// Собственность игрока с установленными усилениями.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PlayerProperty {
+    pub property_id: Uuid,
+    pub cell_index: i32,
+    pub prop_name: String,
+    pub purchase_cost: i64,
+    pub rent_cost: i64,
+    pub upgrades: serde_json::Value, // JSON-массив установленных усилений
+    pub upgrades_count: i32,
+    pub max_upgrades: i32,
 }
 
 /// Состояние игрока на экране игры.
@@ -290,6 +304,7 @@ pub async fn load_game_screen(
         ParticipantState,
         Vec<BoardCell>,
         Vec<InventoryItem>,
+        Vec<PlayerProperty>,
     ),
     DbError,
 > {
@@ -303,8 +318,9 @@ pub async fn load_game_screen(
 
     let cells = get_board_cells(pool, game_id).await?;
     let inventory = get_player_inventory(pool, game_id, user_id).await?;
+    let properties = get_player_properties(pool, game_id, user_id).await?;
 
-    Ok((rules, state, cells, inventory))
+    Ok((rules, state, cells, inventory, properties))
 }
 
 // ----- БЛОК 4: Участники -----
@@ -602,6 +618,119 @@ pub async fn reroll_shop(
     .await?;
     Ok(state)
 }
+// ----- БЛОК 15: Управление собственностью -----
+
+/// Получить список собственностей игрока с установленными усилениями.
+pub async fn get_player_properties(
+    pool: &PgPool,
+    game_id: Uuid,
+    user_id: Uuid,
+) -> Result<Vec<PlayerProperty>, DbError> {
+    let props = sqlx::query_as::<_, PlayerProperty>(
+        "SELECT property_id, cell_index, prop_name, purchase_cost, rent_cost,
+                upgrades, upgrades_count, max_upgrades
+         FROM get_player_properties($1, $2)",
+    )
+    .bind(game_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(props)
+}
+
+/// Установить усиление в собственность.
+/// Возвращает "ok" или текст ошибки.
+pub async fn install_upgrade(
+    pool: &PgPool,
+    game_id: Uuid,
+    user_id: Uuid,
+    property_id: Uuid,
+    power_up_id: Uuid,
+) -> Result<String, DbError> {
+    let row: (String,) = sqlx::query_as("SELECT install_upgrade($1, $2, $3, $4)")
+        .bind(game_id)
+        .bind(user_id)
+        .bind(property_id)
+        .bind(power_up_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+/// Извлечь усиление из собственности обратно в инвентарь.
+/// Возвращает "ok" или текст ошибки.
+pub async fn uninstall_upgrade(
+    pool: &PgPool,
+    game_id: Uuid,
+    user_id: Uuid,
+    property_id: Uuid,
+    power_up_id: Uuid,
+) -> Result<String, DbError> {
+    let row: (String,) = sqlx::query_as("SELECT uninstall_upgrade($1, $2, $3, $4)")
+        .bind(game_id)
+        .bind(user_id)
+        .bind(property_id)
+        .bind(power_up_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+// ----- БЛОК 16: Боты -----
+
+/// Данные одного бота-участника.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BotParticipant {
+    pub user_id: Uuid,
+    pub username: String,
+    pub position: i32,
+    pub balance: i64,
+    pub turn_order: i32,
+}
+
+/// Результат одного хода бота.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BotTurnResult {
+    pub new_position: i32,
+    pub new_balance: i64,
+    pub action: String,
+    pub action_detail: String,
+}
+
+/// Получить список живых ботов игры.
+pub async fn get_bot_participants(
+    pool: &PgPool,
+    game_id: Uuid,
+) -> Result<Vec<BotParticipant>, DbError> {
+    let bots = sqlx::query_as::<_, BotParticipant>(
+        r#"SELECT user_id, username, "position", balance, turn_order
+           FROM get_bot_participants($1)"#,
+    )
+    .bind(game_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(bots)
+}
+
+/// Выполнить один ход бота.
+pub async fn do_bot_turn(
+    pool: &PgPool,
+    game_id: Uuid,
+    bot_id: Uuid,
+    dice: i32,
+) -> Result<BotTurnResult, DbError> {
+    let result = sqlx::query_as::<_, BotTurnResult>(
+        r#"SELECT new_position, new_balance, action, action_detail
+           FROM do_bot_turn($1, $2, $3)"#,
+    )
+    .bind(game_id)
+    .bind(bot_id)
+    .bind(dice)
+    .fetch_one(pool)
+    .await?;
+    Ok(result)
+}
+
 pub async fn pay_tax(
     pool: &PgPool,
     game_id: Uuid,
