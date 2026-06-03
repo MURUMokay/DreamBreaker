@@ -65,6 +65,16 @@ enum CellAction {
 // ─────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────
+#[derive(Debug, Clone)]
+struct TooltipItem {
+    name: String,
+    description: String,
+    effect_type: String,
+    effect_value: i64,
+    buy_cost: Option<i64>,  // None если из инвентаря
+    sell_cost: Option<i64>, // None если из магазина (ещё не куплен)
+}
+
 struct DreamBreaker {
     screen: Screen,
     pool: Option<PgPool>,
@@ -117,7 +127,13 @@ struct DreamBreaker {
     bot_turn_log: Vec<String>,
 
     // Настройки
+    // Тултип усиления
+    tooltip_item: Option<TooltipItem>,
+    tooltip_hover_start: Option<std::time::Instant>,
+    tooltip_visible: bool,
+    tooltip_locked: bool,
     window_mode: WindowMode,
+
     settings_from_game: bool,
     window_width: f32,
     window_height: f32,
@@ -163,6 +179,10 @@ impl Default for DreamBreaker {
             bot_turn_queue: vec![],
             bot_turn_names: vec![],
             bot_turn_log: vec![],
+            tooltip_item: None,
+            tooltip_hover_start: None,
+            tooltip_visible: false,
+            tooltip_locked: false,
             window_mode: WindowMode::Window,
             settings_from_game: false,
             window_width: 1024.0,
@@ -238,6 +258,7 @@ enum Message {
     RentPaid(Result<db::ParticipantState, db::DbError>),
     BoardReloaded(Result<Vec<db::BoardCell>, db::DbError>),
     OpenShop(Uuid),
+    TooltipClose,
     ShopSlotsLoaded(Result<Vec<db::ShopSlot>, db::DbError>),
     BuyShopSlot(Uuid),
     ShopSlotBought(Result<db::ParticipantState, db::DbError>),
@@ -266,7 +287,9 @@ enum Message {
     // Боты
     BotsLoaded(Result<Vec<db::BotParticipant>, db::DbError>),
     BotTurnDone(Result<db::BotTurnResult, db::DbError>),
-
+    TooltipHoverStart(TooltipItem),
+    TooltipHoverEnd,
+    TooltipTick,
     // Настройки
     SetWindowMode(WindowMode),
     WindowResized(f32, f32),
@@ -331,12 +354,22 @@ impl DreamBreaker {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::event::listen_with(|event, _status, _id| match event {
+        let window_sub = iced::event::listen_with(|event, _status, _id| match event {
             iced::Event::Window(iced::window::Event::Resized(size)) => {
                 Some(Message::WindowResized(size.width, size.height))
             }
             _ => None,
-        })
+        });
+
+        if self.tooltip_hover_start.is_some() && !self.tooltip_visible {
+            Subscription::batch([
+                window_sub,
+                iced::time::every(std::time::Duration::from_millis(100))
+                    .map(|_| Message::TooltipTick),
+            ])
+        } else {
+            window_sub
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -807,7 +840,39 @@ impl DreamBreaker {
                 self.screen = Screen::Menu;
                 Task::none()
             }
-
+            Message::TooltipHoverStart(item) => {
+                self.tooltip_item = Some(item);
+                self.tooltip_hover_start = Some(std::time::Instant::now());
+                self.tooltip_visible = false;
+                self.tooltip_locked = false;
+                Task::none()
+            }
+            Message::TooltipHoverEnd => {
+                // Если тултип уже показан и залочен — не скрываем,
+                // пока мышь не уйдёт из самого тултипа
+                if !self.tooltip_locked {
+                    self.tooltip_item = None;
+                    self.tooltip_hover_start = None;
+                    self.tooltip_visible = false;
+                }
+                Task::none()
+            }
+            Message::TooltipTick => {
+                if let Some(start) = self.tooltip_hover_start {
+                    if start.elapsed() >= std::time::Duration::from_millis(1500) {
+                        self.tooltip_visible = true;
+                        self.tooltip_locked = true;
+                    }
+                }
+                Task::none()
+            }
+            Message::TooltipClose => {
+                self.tooltip_item = None;
+                self.tooltip_hover_start = None;
+                self.tooltip_visible = false;
+                self.tooltip_locked = false;
+                Task::none()
+            }
             // ── Настройки ──────────────────────────────────
             Message::SetWindowMode(mode) => {
                 self.window_mode = mode;
@@ -1816,18 +1881,28 @@ impl DreamBreaker {
             with_dropdown
         };
 
-        let with_property_mgmt: Element<'_, Message> = if self.show_property_mgmt && in_game {
-            let overlay = self.view_property_mgmt_overlay();
+        let with_stats = if self.show_stats {
+            let overlay = self.view_stats_overlay();
             stack![with_game_menu, overlay].into()
         } else {
             with_game_menu
         };
 
-        if self.show_stats {
-            let overlay = self.view_stats_overlay();
-            stack![with_property_mgmt, overlay].into()
+        let shop_open = matches!(&self.cell_action, Some(CellAction::Shop { .. }))
+            && !self.shop_slots.is_empty();
+
+        let with_shop = if shop_open {
+            let overlay = self.view_shop_overlay();
+            stack![with_stats, overlay].into()
         } else {
-            with_property_mgmt
+            with_stats
+        };
+
+        if self.tooltip_visible {
+            let tip = self.view_tooltip_overlay();
+            stack![with_shop, tip].into()
+        } else {
+            with_shop
         }
     }
 
@@ -1907,8 +1982,10 @@ impl DreamBreaker {
                 .padding(self.s(4.0) as u16),
         )
         .padding(iced::Padding {
-            top: self.s(60.0),
-            ..Default::default()
+            top: self.s(44.0),
+            right: 0.0,
+            bottom: 0.0,
+            left: self.s(8.0),
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -2044,7 +2121,228 @@ impl DreamBreaker {
         .on_press(Message::ToggleGameMenu)
         .into()
     }
+    fn view_shop_overlay(&self) -> Element<'_, Message> {
+        let (shop_id, reroll_count) = match &self.cell_action {
+            Some(CellAction::Shop { shop_id }) => {
+                let rc = self.shop_slots.first().map(|s| s.reroll_count).unwrap_or(0);
+                (*shop_id, rc)
+            }
+            _ => return Space::new(Length::Fixed(0.0), Length::Fixed(0.0)).into(),
+        };
+        let reroll_cost = 50 + 15 * reroll_count as i64;
+        let sc = self.scale();
 
+        // Сетка слотов 2×2
+        let mut slots_grid = column![].spacing(self.s(8.0) as u16);
+        let visible: Vec<&db::ShopSlot> = self
+            .shop_slots
+            .iter()
+            .filter(|s| s.status != "rerolled")
+            .collect();
+
+        for chunk in visible.chunks(2) {
+            let mut slot_row = row![].spacing(self.s(8.0) as u16);
+            for slot in chunk {
+                let slot_id = slot.slot_id;
+                let inv_full = self.inventory.iter().map(|i| i.quantity).sum::<i32>() >= 5;
+
+                let buy_btn: Element<'_, Message> = if slot.status == "sold" {
+                    container(text("Куплено").size(self.ts(12)))
+                        .width(Length::Fixed(self.s(160.0)))
+                        .height(Length::Fixed(self.s(28.0)))
+                        .align_x(iced::alignment::Horizontal::Center)
+                        .align_y(iced::alignment::Vertical::Center)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(
+                                0.2, 0.2, 0.2, 0.6,
+                            ))),
+                            ..Default::default()
+                        })
+                        .into()
+                } else if slot.already_own {
+                    container(text("Уже есть").size(self.ts(12)))
+                        .width(Length::Fixed(self.s(160.0)))
+                        .height(Length::Fixed(self.s(28.0)))
+                        .align_x(iced::alignment::Horizontal::Center)
+                        .align_y(iced::alignment::Vertical::Center)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(
+                                0.2, 0.2, 0.2, 0.6,
+                            ))),
+                            ..Default::default()
+                        })
+                        .into()
+                } else if inv_full {
+                    container(text("Нет места").size(self.ts(12)))
+                        .width(Length::Fixed(self.s(160.0)))
+                        .height(Length::Fixed(self.s(28.0)))
+                        .align_x(iced::alignment::Horizontal::Center)
+                        .align_y(iced::alignment::Vertical::Center)
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(
+                                0.2, 0.2, 0.2, 0.6,
+                            ))),
+                            ..Default::default()
+                        })
+                        .into()
+                } else {
+                    button(text(format!("Купить {}", slot.cost)).size(self.ts(13)))
+                        .on_press(Message::BuyShopSlot(slot_id))
+                        .width(Length::Fixed(self.s(160.0)))
+                        .padding(self.s(5.0) as u16)
+                        .into()
+                };
+
+                let slot_card: Element<'_, Message> = container(
+                    column![
+                        text(slot.name.clone()).size(self.ts(13)),
+                        Space::with_height(self.s(6.0)),
+                        buy_btn,
+                    ]
+                    .spacing(self.s(2.0) as u16)
+                    .padding(self.s(10.0) as u16)
+                    .align_x(Alignment::Center)
+                    .width(Length::Fixed(self.s(180.0))),
+                )
+                .width(Length::Fixed(self.s(180.0)))
+                .height(Length::Fixed(self.s(100.0)))
+                .style(|_| container::Style {
+                    background: Some(Background::Color(Color::from_rgba(0.12, 0.12, 0.22, 1.0))),
+                    border: iced::Border {
+                        color: Color::from_rgba(0.4, 0.4, 0.8, 0.7),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into();
+                let tip_item = TooltipItem {
+                    name: slot.name.clone(),
+                    description: slot.description.clone(),
+                    effect_type: String::new(),
+                    effect_value: 0,
+                    buy_cost: Some(slot.cost),
+                    sell_cost: Some(slot.cost / 2),
+                };
+                let tip_item_end = tip_item.clone();
+                let slot_with_hover: Element<'_, Message> = mouse_area(slot_card)
+                    .on_enter(Message::TooltipHoverStart(tip_item))
+                    .on_exit(Message::TooltipHoverEnd)
+                    .into();
+                slot_row = slot_row.push(slot_with_hover);
+            }
+            slots_grid = slots_grid.push(slot_row);
+        }
+
+        let content = column![
+            text("Магазин усилений").size(self.ts(20)),
+            Space::with_height(self.s(12.0)),
+            slots_grid,
+            Space::with_height(self.s(12.0)),
+            button(text(format!("Обновить ассортимент ({})", reroll_cost)).size(self.ts(13)))
+                .on_press(Message::RerollShop(shop_id))
+                .padding(self.s(8.0) as u16)
+                .width(Length::Fixed(self.s(380.0))),
+            Space::with_height(self.s(8.0)),
+            button(text("Выйти из магазина").size(self.ts(13)))
+                .on_press(Message::SkipAction)
+                .padding(self.s(8.0) as u16)
+                .width(Length::Fixed(self.s(380.0))),
+        ]
+        .spacing(self.s(4.0) as u16)
+        .padding(self.s(20.0) as u16)
+        .align_x(Alignment::Center);
+
+        let card = container(content)
+            .width(Length::Fixed(self.s(420.0)))
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.05, 0.05, 0.15, 0.98))),
+                border: iced::Border {
+                    color: Color::from_rgba(0.4, 0.4, 0.9, 0.8),
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                ..Default::default()
+            });
+
+        container(
+            container(card)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.65))),
+            ..Default::default()
+        })
+        .into()
+    }
+    fn view_tooltip_overlay(&self) -> Element<'_, Message> {
+        let item = match &self.tooltip_item {
+            Some(i) => i,
+            None => return Space::new(Length::Fixed(0.0), Length::Fixed(0.0)).into(),
+        };
+
+        let mut col = column![
+            text(&item.name).size(self.ts(16)),
+            Space::with_height(self.s(6.0)),
+            text(&item.description).size(self.ts(12)),
+        ]
+        .spacing(self.s(2.0) as u16)
+        .padding(self.s(14.0) as u16);
+
+        if !item.effect_type.is_empty() {
+            let effect_str = match item.effect_type.as_str() {
+                "flat_base" => format!("+{} к базовой аренде", item.effect_value),
+                "percent_bonus" => format!("+{}% к аренде", item.effect_value),
+                "flat_final" => format!("+{} к итоговой аренде", item.effect_value),
+                other => other.to_string(),
+            };
+            col = col.push(Space::with_height(self.s(4.0)));
+            col = col.push(text(format!("Эффект: {}", effect_str)).size(self.ts(12)));
+        }
+
+        if let Some(buy) = item.buy_cost {
+            col = col.push(text(format!("Цена покупки: {}", buy)).size(self.ts(12)));
+        }
+        if let Some(sell) = item.sell_cost {
+            col = col.push(text(format!("Цена продажи: {}", sell)).size(self.ts(12)));
+        }
+
+        let card = container(col)
+            .width(Length::Fixed(self.s(280.0)))
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.05, 0.05, 0.18, 0.93))),
+                border: iced::Border {
+                    color: Color::from_rgba(0.5, 0.5, 1.0, 0.7),
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+
+        // Позиционируем по центру экрана, чуть выше середины
+        mouse_area(
+            container(
+                container(card)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .align_y(iced::alignment::Vertical::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.0))),
+                ..Default::default()
+            }),
+        )
+        .on_exit(Message::TooltipClose)
+        .into()
+    }
     fn view_menu(&self) -> Element<'_, Message> {
         let sc = self.scale();
         let has_games = matches!(self.has_active_game, Some(true));
@@ -2405,9 +2703,9 @@ impl DreamBreaker {
         let icon_size = self.ts(14) as f32 * 0.75;
 
         let prop_btn_label = if self.show_property_mgmt {
-            "▲ Моя собственность"
+            "▲ Мои объекты"
         } else {
-            "▼ Моя собственность"
+            "▼ Мои объекты"
         };
         let prop_btn: Element<'_, Message> = button(text(prop_btn_label).size(self.ts(11)))
             .on_press(Message::TogglePropertyMgmt)
@@ -2415,43 +2713,55 @@ impl DreamBreaker {
             .width(Length::Fill)
             .into();
 
-        let cell_size = self.s(54.0);
-        let top_offset = cell_size * 1.5;
+        let stats_panel = container(
+            column![
+                row![
+                    svg(std::path::Path::new("assets/money_icon.svg"))
+                        .width(Length::Fixed(icon_size))
+                        .height(Length::Fixed(icon_size)),
+                    text(format!("Баланс:   {}", state.balance)).size(self.ts(14)),
+                ]
+                .spacing(self.s(4.0) as u16)
+                .align_y(Alignment::Center),
+                row![
+                    svg(std::path::Path::new("assets/money_icon.svg"))
+                        .width(Length::Fixed(icon_size))
+                        .height(Length::Fixed(icon_size)),
+                    text(format!("Цель:     {}", rules.target_balance)).size(self.ts(14)),
+                ]
+                .spacing(self.s(4.0) as u16)
+                .align_y(Alignment::Center),
+                text(format!(
+                    "Ходов:    {}/{}",
+                    state.moves_made, rules.max_turns
+                ))
+                .size(self.ts(14)),
+                text(format!("Осталось: {}", turns_left)).size(self.ts(14)),
+                Space::with_height(self.s(6.0)),
+                text("Инвентарь").size(self.ts(12)),
+                Space::with_height(self.s(3.0)),
+                inv_row,
+                Space::with_height(self.s(6.0)),
+                prop_btn,
+            ]
+            .spacing(self.s(3.0) as u16)
+            .padding(self.s(10.0) as u16),
+        )
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.05, 0.05, 0.10, 0.84))),
+            border: iced::Border {
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.13),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        });
 
         // Кнопка броска кубика + результат
-        // === Иконки кубиков + результат броска ===
-        // === Иконки кубиков + результат броска ===
         let dice_result_text: Element<'_, Message> = match self.dice_roll {
-            Some((d1, d2)) => {
-                let sum = d1 + d2;
-                let dice_size = self.s(42.0);
-
-                let dice1_path = format!("assets/dice_{}.svg", d1);
-                let dice2_path = format!("assets/dice_{}.svg", d2);
-
-                let dice1 = svg(std::path::Path::new(&dice1_path))
-                    .width(Length::Fixed(dice_size))
-                    .height(Length::Fixed(dice_size));
-
-                let dice2 = svg(std::path::Path::new(&dice2_path))
-                    .width(Length::Fixed(dice_size))
-                    .height(Length::Fixed(dice_size));
-
-                row![
-                    dice1,
-                    text(" + ").size(self.ts(18)),
-                    dice2,
-                    text(" = ").size(self.ts(18)),
-                    text(sum.to_string())
-                        .size(self.ts(22))
-                        .style(|_| text::Style {
-                            color: Some(Color::from_rgb(1.0, 0.8, 0.0)),
-                        }),
-                ]
-                .spacing(self.s(8.0) as u16)
-                .align_y(Alignment::Center)
-                .into()
-            }
+            Some((d1, d2)) => text(format!("{} + {} = {}", d1, d2, d1 + d2))
+                .size(self.ts(16))
+                .into(),
             None => text("").size(self.ts(16)).into(),
         };
 
@@ -2478,9 +2788,17 @@ impl DreamBreaker {
                 .width(Length::Fixed(self.s(180.0)))
         };
 
+        // Фиксированная высота для строки результата — предотвращает сдвиг поля
+        let dice_result_row: Element<'_, Message> = container(dice_result_text)
+            .width(Length::Fixed(self.s(180.0)))
+            .height(Length::Fixed(self.s(24.0)))
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center)
+            .into();
+
         let dice_block: Element<'_, Message> = column![
             roll_btn,
-            dice_result_text,
+            dice_result_row,
             Space::with_height(self.s(4.0)),
             end_btn,
         ]
@@ -2515,145 +2833,7 @@ impl DreamBreaker {
                 })
                 .into(),
             ),
-            Some(CellAction::Shop { shop_id }) => {
-                let shop_id = *shop_id;
-                let reroll_count = self.shop_slots.first().map(|s| s.reroll_count).unwrap_or(0);
-                let reroll_cost = 50 + 15 * reroll_count as i64;
-
-                let mut slots_row = row![].spacing(self.s(8.0) as u16);
-                for slot in &self.shop_slots {
-                    if slot.status == "rerolled" {
-                        continue;
-                    }
-                    let slot_id = slot.slot_id;
-                    let _can_buy = slot.status == "available" && !slot.already_own;
-                    let btn: Element<'_, Message> = if slot.status == "sold" {
-                        container(text("Продано").size(self.ts(11)))
-                            .width(Length::Fixed(self.s(120.0)))
-                            .height(Length::Fixed(self.s(24.0)))
-                            .align_x(iced::alignment::Horizontal::Center)
-                            .align_y(iced::alignment::Vertical::Center)
-                            .style(|_| container::Style {
-                                background: Some(Background::Color(Color::from_rgba(
-                                    0.3, 0.3, 0.3, 0.5,
-                                ))),
-                                ..Default::default()
-                            })
-                            .into()
-                    } else if slot.already_own {
-                        container(text("Уже есть").size(self.ts(11)))
-                            .width(Length::Fixed(self.s(120.0)))
-                            .height(Length::Fixed(self.s(24.0)))
-                            .align_x(iced::alignment::Horizontal::Center)
-                            .align_y(iced::alignment::Vertical::Center)
-                            .style(|_| container::Style {
-                                background: Some(Background::Color(Color::from_rgba(
-                                    0.3, 0.3, 0.3, 0.5,
-                                ))),
-                                ..Default::default()
-                            })
-                            .into()
-                    } else {
-                        let inv_full = self.inventory.iter().map(|i| i.quantity).sum::<i32>() >= 5;
-
-                        if inv_full {
-                            container(text("Инвентарь полон").size(self.ts(11)))
-                                .width(Length::Fixed(self.s(120.0)))
-                                .height(Length::Fixed(self.s(24.0)))
-                                .align_x(iced::alignment::Horizontal::Center)
-                                .align_y(iced::alignment::Vertical::Center)
-                                .style(|_| container::Style {
-                                    background: Some(Background::Color(Color::from_rgba(
-                                        0.3, 0.3, 0.3, 0.5,
-                                    ))),
-                                    ..Default::default()
-                                })
-                                .into()
-                        } else {
-                            button(text(format!("Купить {}", slot.cost)).size(self.ts(11)))
-                                .on_press(Message::BuyShopSlot(slot_id))
-                                .width(Length::Fixed(self.s(120.0)))
-                                .padding(self.s(4.0) as u16)
-                                .into()
-                        }
-                    };
-
-                    let slot_col: Element<'_, Message> = container(
-                        column![
-                            text(slot.name.clone()).size(self.ts(12)),
-                            Space::with_height(self.s(2.0)),
-                            text(slot.description.chars().take(40).collect::<String>())
-                                .size(self.ts(10)),
-                            Space::with_height(self.s(4.0)),
-                            btn,
-                        ]
-                        .align_x(Alignment::Center)
-                        .spacing(self.s(2.0) as u16)
-                        .padding(self.s(6.0) as u16),
-                    )
-                    .width(Length::Fixed(self.s(130.0)))
-                    .style(|_| container::Style {
-                        background: Some(Background::Color(Color::from_rgba(
-                            0.15, 0.15, 0.25, 0.95,
-                        ))),
-                        border: iced::Border {
-                            color: Color::from_rgba(0.4, 0.4, 0.7, 0.6),
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        ..Default::default()
-                    })
-                    .into();
-                    slots_row = slots_row.push(slot_col);
-                }
-
-                // Если слоты ещё не загружены — загружаем
-                let content: Element<'_, Message> = if self.shop_slots.is_empty() {
-                    column![
-                        text("Магазин усилений").size(self.ts(15)),
-                        button(text("Открыть магазин").size(self.ts(13)))
-                            .on_press(Message::OpenShop(shop_id))
-                            .padding(self.s(8.0) as u16),
-                    ]
-                    .align_x(Alignment::Center)
-                    .spacing(self.s(6.0) as u16)
-                    .padding(self.s(10.0) as u16)
-                    .into()
-                } else {
-                    column![
-                        text("Магазин усилений").size(self.ts(15)),
-                        Space::with_height(self.s(6.0)),
-                        slots_row,
-                        Space::with_height(self.s(6.0)),
-                        button(
-                            text(format!("Обновить ассортимент ({})", reroll_cost))
-                                .size(self.ts(12))
-                        )
-                        .on_press(Message::RerollShop(shop_id))
-                        .padding(self.s(6.0) as u16),
-                    ]
-                    .align_x(Alignment::Center)
-                    .spacing(self.s(4.0) as u16)
-                    .padding(self.s(10.0) as u16)
-                    .into()
-                };
-
-                Some(
-                    container(content)
-                        .style(|_| container::Style {
-                            background: Some(Background::Color(Color::from_rgba(
-                                0.05, 0.05, 0.2, 0.95,
-                            ))),
-                            border: iced::Border {
-                                color: Color::from_rgba(0.3, 0.3, 0.9, 0.8),
-                                width: 1.0,
-                                radius: 8.0.into(),
-                            },
-                            ..Default::default()
-                        })
-                        .into(),
-                )
-            }
+            Some(CellAction::Shop { .. }) => None,
             Some(CellAction::MustPayRent { rent, owner, .. }) => Some(
                 container(
                     column![
@@ -2720,142 +2900,161 @@ impl DreamBreaker {
             None => None,
         };
 
-        // В center_panel добавить action_block
-        let mut center_col = column![].align_x(Alignment::Center).spacing(0);
+        // ── Левая панель: статистика + инвентарь + управление объектами ──
+        let mut left_col = column![stats_panel,]
+            .spacing(self.s(6.0) as u16)
+            .width(Length::Fixed(self.s(310.0)));
 
-        if let Some(action) = action_block {
-            center_col = center_col.push(action);
-            center_col = center_col.push(Space::with_height(self.s(8.0)));
+        if self.show_property_mgmt {
+            left_col = left_col.push(self.view_property_mgmt());
         }
 
-        center_col = center_col.push(dice_block);
-
-        let center_panel: Element<'_, Message> = center_col.into();
-
-        let panel_overlay: Element<'_, Message> = container(center_panel)
-            .width(Length::Fill)
+        let left_panel: Element<'_, Message> = container(left_col)
+            .padding(self.s(8.0))
             .height(Length::Fill)
-            .padding(iced::Padding {
-                top: top_offset,
-                right: 0.0,
-                bottom: 0.0,
-                left: 0.0,
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.05, 0.7))),
+                ..Default::default()
             })
-            .align_x(iced::alignment::Horizontal::Center)
-            .align_y(iced::alignment::Vertical::Top)
             .into();
-        // === НОВАЯ СТАТИСТИКА В ВЕРХНЕЙ ЧАСТИ ИГРОВОГО ПОЛЯ ===
-        let icon_size = self.s(18.0);
 
-        let game_stats = column![
-            row![
-                svg(std::path::Path::new("assets/money_icon.svg"))
-                    .width(Length::Fixed(icon_size))
-                    .height(Length::Fixed(icon_size)),
-                text("Баланс: ").size(self.ts(13)),
-                text(state.balance.to_string())
-                    .size(self.ts(14))
-                    .style(|_| text::Style {
-                        color: Some(Color::from_rgb(0.2, 1.0, 0.3)),
-                    }),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-            row![
-                svg(std::path::Path::new("assets/money_icon.svg"))
-                    .width(Length::Fixed(icon_size))
-                    .height(Length::Fixed(icon_size)),
-                text("Цель: ").size(self.ts(13)),
-                text(rules.target_balance.to_string()).size(self.ts(13)),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-            row![
-                text("Ходы: ").size(self.ts(13)),
-                text(format!("{}/{}", state.moves_made, rules.max_turns)).size(self.ts(13)),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-            text(format!(
-                "Осталось: {}",
-                (rules.max_turns - state.moves_made).max(0)
-            ))
-            .size(self.ts(12))
-            .style(|_| text::Style {
-                color: Some(Color::from_rgb(0.7, 0.8, 1.0))
-            }),
-            Space::with_height(self.s(8.0)), // небольшой отступ перед кнопкой
-            prop_btn,
-        ]
-        .spacing(4)
-        .padding(12);
-
-        let stats_overlay = container(game_stats).style(|_theme| container::Style {
-            background: Some(Background::Color(Color::from_rgba(0.02, 0.02, 0.1, 0.92))),
-            border: iced::Border {
-                color: Color::from_rgba(0.4, 0.6, 1.0, 0.7),
-                width: 1.5,
-                radius: 8.0.into(),
-            },
-            ..Default::default()
-        });
-
-        let stats_positioned: Element<'_, Message> = container(stats_overlay)
-            .padding(iced::Padding {
-                top: self.s(18.0),
-                right: 0.0,
-                bottom: 0.0,
-                left: self.s(24.0),
-            })
-            .max_width(self.window_width * 0.35) // не шире 35% окна
-            .max_height(self.window_height * 0.4) // не выше 40% окна
-            .align_x(iced::alignment::Horizontal::Left)
-            .align_y(iced::alignment::Vertical::Top)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        // ── Центр: игровое поле + оверлей кубика ─────────────────────────
         let board = self.view_board(self.local_player_pos);
 
-        // === ПРАВЫЙ САЙДБАР С ХОДАМИ БОТОВ ===
-        let bot_log_panel: Element<'_, Message> = if !self.bot_turn_log.is_empty() {
-            let mut log_col = column![text("Ходы ботов:").size(self.ts(11)),]
-                .spacing(1)
-                .padding(self.s(8.0) as u16);
+        // Оверлей кубика и действия — по центру внизу поля
+        let mut center_overlay_col = column![]
+            .spacing(self.s(6.0) as u16)
+            .align_x(Alignment::Center);
 
+        if let Some(action) = action_block {
+            center_overlay_col = center_overlay_col.push(action);
+        }
+        center_overlay_col = center_overlay_col.push(dice_block);
+
+        let center_overlay: Element<'_, Message> = container(center_overlay_col)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center)
+            .into();
+
+        let board_with_overlay: Element<'_, Message> = stack![board, center_overlay].into();
+
+        // ── Правая панель: статус ботов + лог ────────────────────────────
+        let mut right_col = column![]
+            .spacing(self.s(8.0) as u16)
+            .align_x(Alignment::Center);
+
+        // Панель статусов ботов
+        if !self.bot_participants.is_empty() {
+            let mut bots_col = column![
+                text("Боты:").size(self.ts(11)),
+                Space::with_height(self.s(2.0)),
+            ]
+            .spacing(self.s(3.0) as u16);
+
+            for (i, bot) in self.bot_participants.iter().enumerate() {
+                let color = match i % 4 {
+                    0 => Color::from_rgb(1.0, 0.3, 0.3),
+                    1 => Color::from_rgb(0.3, 1.0, 0.4),
+                    2 => Color::from_rgb(0.3, 0.7, 1.0),
+                    _ => Color::from_rgb(1.0, 0.85, 0.1),
+                };
+                // Количество собственностей бота из board_cells
+                let bot_props = self
+                    .board_cells
+                    .iter()
+                    .filter(|c| c.cell_type == "property" && c.owner_user_id == Some(bot.user_id))
+                    .count();
+
+                let name_short: String = bot.username.chars().take(10).collect();
+                let money_icon_sz = self.s(10.0);
+                let bot_row: Element<'_, Message> = container(
+                    row![
+                        // Цветной квадрат — цвет бота
+                        container(Space::new(
+                            Length::Fixed(self.s(6.0)),
+                            Length::Fixed(self.s(6.0)),
+                        ))
+                        .style(move |_| container::Style {
+                            background: Some(Background::Color(color)),
+                            border: iced::Border {
+                                radius: 3.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                        text(name_short).size(self.ts(10)),
+                        svg(std::path::Path::new("assets/money_icon.svg"))
+                            .width(Length::Fixed(money_icon_sz))
+                            .height(Length::Fixed(money_icon_sz)),
+                        text(format!("{}", bot.balance)).size(self.ts(10)),
+                        text(format!("| {} Н.", bot_props)).size(self.ts(10)),
+                    ]
+                    .spacing(self.s(3.0) as u16)
+                    .align_y(Alignment::Center),
+                )
+                .padding(iced::Padding {
+                    top: self.s(2.0),
+                    bottom: self.s(2.0),
+                    left: self.s(4.0),
+                    right: self.s(4.0),
+                })
+                .into();
+                bots_col = bots_col.push(bot_row);
+            }
+
+            right_col = right_col.push(
+                container(bots_col)
+                    .padding(self.s(6.0))
+                    .width(Length::Fixed(self.s(200.0)))
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.45))),
+                        border: iced::Border {
+                            color: Color::from_rgba(1.0, 1.0, 1.0, 0.15),
+                            width: 1.0,
+                            radius: iced::border::Radius::from(4.0),
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
+
+        // Лог ходов ботов
+        if !self.bot_turn_log.is_empty() {
+            let mut log_col = column![text("Ходы ботов:").size(self.ts(11))].spacing(2);
             for line in self.bot_turn_log.iter().rev().take(6) {
                 log_col = log_col.push(text(line).size(self.ts(10)));
             }
+            right_col = right_col.push(
+                container(log_col)
+                    .padding(self.s(6.0))
+                    .width(Length::Fixed(self.s(200.0)))
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.45))),
+                        border: iced::Border {
+                            color: Color::from_rgba(1.0, 1.0, 1.0, 0.15),
+                            width: 1.0,
+                            radius: iced::border::Radius::from(4.0),
+                        },
+                        ..Default::default()
+                    }),
+            );
+        }
 
-            container(log_col)
-                .width(Length::Fixed(self.s(220.0)))
-                .style(|_theme| container::Style {
-                    background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
-                    border: iced::Border {
-                        color: Color::from_rgba(0.6, 0.8, 1.0, 0.4),
-                        width: 1.0,
-                        radius: 6.0.into(),
-                    },
-                    ..Default::default()
-                })
-                .into()
-        } else {
-            Space::new(Length::Shrink, Length::Shrink).into()
-        };
-
-        let right_sidebar: Element<'_, Message> = container(bot_log_panel)
-            .padding(iced::Padding {
-                top: top_offset + self.s(20.0),
-                right: self.s(12.0),
-                bottom: 0.0,
-                left: 0.0,
-            })
-            .align_x(iced::alignment::Horizontal::Right)
-            .align_y(iced::alignment::Vertical::Top)
-            .width(Length::Fill)
+        let right_panel: Element<'_, Message> = container(right_col)
+            .padding(self.s(8.0))
+            .width(Length::Fixed(self.s(200.0)))
             .height(Length::Fill)
+            .align_y(iced::alignment::Vertical::Top)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.05, 0.7))),
+                ..Default::default()
+            })
             .into();
 
-        stack![board, panel_overlay, right_sidebar, stats_positioned]
+        // ── Финальная сборка ─────────────────────────────────────────────
+        row![left_panel, board_with_overlay, right_panel]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -2891,7 +3090,10 @@ impl DreamBreaker {
             self.board_cells.iter().map(|c| (c.cell_index, c)).collect();
 
         let available_h = self.window_height - self.s(40.0) - self.s(28.0);
-        let available_w = self.window_width;
+        // Вычитаем ширину левой (~310) и правой (~220) панелей с отступами
+        let left_panel_w = self.s(310.0) + self.s(16.0);
+        let right_panel_w = self.s(200.0) + self.s(16.0);
+        let available_w = (self.window_width - left_panel_w - right_panel_w).max(100.0);
         let cell_size = (available_h / 11.0).min(available_w / 11.0).floor();
 
         let fs = (cell_size / 54.0 * 10.0).max(7.0);
@@ -2999,36 +3201,6 @@ impl DreamBreaker {
                             }
                         };
 
-                        // ── Индикатор владельца собственности ────────────
-                        // Тонкая полоска внутри клетки, залитая цветом владельца.
-                        // Для property-клетки с owner — показываем.
-                        let owner_bar: Option<Element<'_, Message>> = cell_map
-                            .get(&idx)
-                            .and_then(|c| {
-                                if c.cell_type == "property" {
-                                    c.owner_user_id
-                                } else {
-                                    None
-                                }
-                            })
-                            .map(|owner_uid| {
-                                let owner_color = participant_color(owner_uid);
-                                let bar_thick = (cell_size * 0.14).max(3.0);
-                                // Полоска вдоль внутренней стороны (противоположной цветной полосе)
-                                let (bar_w, bar_h) = match side {
-                                    "top" | "bottom" => (Length::Fill, Length::Fixed(bar_thick)),
-                                    _ => (Length::Fixed(bar_thick), Length::Fill),
-                                };
-                                container(Space::new(Length::Fill, Length::Fill))
-                                    .width(bar_w)
-                                    .height(bar_h)
-                                    .style(move |_| container::Style {
-                                        background: Some(Background::Color(owner_color)),
-                                        ..Default::default()
-                                    })
-                                    .into()
-                            });
-
                         // ── Цветная полоска группы собственности ─────────
                         let color_stripe: Option<Color> =
                             if cell_map.get(&idx).map(|c| c.cell_type.as_str()) == Some("property")
@@ -3076,8 +3248,11 @@ impl DreamBreaker {
 
                             if is_prop {
                                 if let Some(cell) = cell_map.get(&idx) {
+                                    // Уровень усилений: 0 если клетка не принадлежит игроку
+                                    // (боты/свободные), иначе — из player_properties
                                     let upg = prop_upgrades_map.get(&idx).copied().unwrap_or(0);
-                                    let prop_svg_size = (cell_size * 0.96).max(20.0);
+                                    let prop_svg_size = cell_size;
+
                                     let short_name = cell
                                         .prop_name
                                         .as_deref()
@@ -3098,7 +3273,6 @@ impl DreamBreaker {
                                         .height(Length::Fixed(prop_svg_size))
                                         .into()
                                 } else {
-                                    // fallback
                                     column![text(label).size(fs), text(sublabel).size(fs_sm)]
                                         .align_x(Alignment::Center)
                                         .spacing(1)
@@ -3144,9 +3318,6 @@ impl DreamBreaker {
                                         .width(Length::Fill)
                                         .height(Length::Fill),
                                 );
-                                if let Some(bar) = owner_bar {
-                                    col = col.push(bar);
-                                }
                                 col = col.push(
                                     container(icons_el)
                                         .width(Length::Fill)
@@ -3162,9 +3333,6 @@ impl DreamBreaker {
                                         .width(Length::Fill)
                                         .align_x(iced::alignment::Horizontal::Center),
                                 );
-                                if let Some(bar) = owner_bar {
-                                    col = col.push(bar);
-                                }
                                 col = col.push(
                                     container(text_core)
                                         .width(Length::Fill)
@@ -3180,9 +3348,6 @@ impl DreamBreaker {
                                         .height(Length::Fill)
                                         .width(Length::Fill),
                                 );
-                                if let Some(bar) = owner_bar {
-                                    r = r.push(bar);
-                                }
                                 r = r.push(
                                     container(icons_el)
                                         .height(Length::Fill)
@@ -3198,9 +3363,6 @@ impl DreamBreaker {
                                         .height(Length::Fill)
                                         .align_y(iced::alignment::Vertical::Center),
                                 );
-                                if let Some(bar) = owner_bar {
-                                    r = r.push(bar);
-                                }
                                 r = r.push(
                                     container(text_core)
                                         .height(Length::Fill)
@@ -3218,49 +3380,142 @@ impl DreamBreaker {
                             None
                         };
 
-                        let cell_body: Element<'_, Message> = if let Some(color) = color_stripe {
-                            let stripe: Element<'_, Message> =
-                                container(Space::new(Length::Fill, Length::Fill))
-                                    .width(match side {
-                                        "left" | "right" => Length::Fixed(stripe_size),
-                                        _ => Length::Fill,
-                                    })
-                                    .height(match side {
-                                        "top" | "bottom" => Length::Fixed(stripe_size),
-                                        _ => Length::Fill,
-                                    })
-                                    .style(move |_| container::Style {
-                                        background: Some(Background::Color(color)),
-                                        ..Default::default()
-                                    })
-                                    .into();
+                        // Полоска группы и полоска владельца рисуются через stack,
+                        // чтобы не вытеснять SVG-иконку из лайаута.
+                        // inner_el всегда занимает полный cell_size.
+                        let base_cell: Element<'_, Message> = container(inner_el)
+                            .width(Length::Fixed(cell_size))
+                            .height(Length::Fixed(cell_size))
+                            .style(move |_| container::Style {
+                                background: bg,
+                                ..Default::default()
+                            })
+                            .into();
 
-                            let layered: Element<'_, Message> = match side {
-                                "bottom" => column![stripe, inner_el].spacing(0).into(),
-                                "top" => column![inner_el, stripe].spacing(0).into(),
-                                "right" => row![stripe, inner_el].spacing(0).into(),
-                                _ => row![inner_el, stripe].spacing(0).into(),
+                        let has_owner = cell_map
+                            .get(&idx)
+                            .map(|c| c.cell_type == "property" && c.owner_user_id.is_some())
+                            .unwrap_or(false);
+
+                        let cell_body: Element<'_, Message> = if color_stripe.is_some() || has_owner
+                        {
+                            // Слой с двумя полосками: снаружи — цвет группы, изнутри — цвет владельца.
+                            // Реализуем как column/row из двух тонких container'ов внутри stack.
+                            let overlay: Element<'_, Message> = {
+                                let bar_thick = (cell_size * 0.10).max(3.0);
+
+                                // Полоска группы (внешняя сторона клетки)
+                                let group_bar: Element<'_, Message> = if let Some(gc) = color_stripe
+                                {
+                                    container(Space::new(Length::Fill, Length::Fill))
+                                        .width(match side {
+                                            "left" | "right" => Length::Fixed(bar_thick),
+                                            _ => Length::Fill,
+                                        })
+                                        .height(match side {
+                                            "top" | "bottom" => Length::Fixed(bar_thick),
+                                            _ => Length::Fill,
+                                        })
+                                        .style(move |_| container::Style {
+                                            background: Some(Background::Color(gc)),
+                                            ..Default::default()
+                                        })
+                                        .into()
+                                } else {
+                                    Space::new(
+                                        match side {
+                                            "left" | "right" => Length::Fixed(bar_thick),
+                                            _ => Length::Fill,
+                                        },
+                                        match side {
+                                            "top" | "bottom" => Length::Fixed(bar_thick),
+                                            _ => Length::Fill,
+                                        },
+                                    )
+                                    .into()
+                                };
+
+                                // Полоска владельца (внутренняя сторона клетки)
+                                let owner_strip: Element<'_, Message> = if let Some(oc) =
+                                    cell_map.get(&idx).and_then(|c| {
+                                        if c.cell_type == "property" {
+                                            c.owner_user_id
+                                        } else {
+                                            None
+                                        }
+                                    }) {
+                                    let owner_color = participant_color(oc);
+                                    container(Space::new(Length::Fill, Length::Fill))
+                                        .width(match side {
+                                            "left" | "right" => Length::Fixed(bar_thick),
+                                            _ => Length::Fill,
+                                        })
+                                        .height(match side {
+                                            "top" | "bottom" => Length::Fixed(bar_thick),
+                                            _ => Length::Fill,
+                                        })
+                                        .style(move |_| container::Style {
+                                            background: Some(Background::Color(owner_color)),
+                                            ..Default::default()
+                                        })
+                                        .into()
+                                } else {
+                                    Space::new(
+                                        match side {
+                                            "left" | "right" => Length::Fixed(bar_thick),
+                                            _ => Length::Fill,
+                                        },
+                                        match side {
+                                            "top" | "bottom" => Length::Fixed(bar_thick),
+                                            _ => Length::Fill,
+                                        },
+                                    )
+                                    .into()
+                                };
+
+                                // Собираем: снаружи group_bar, изнутри owner_strip,
+                                // между ними пустое пространство
+                                let bars: Element<'_, Message> = match side {
+                                    "bottom" => column![
+                                        group_bar,
+                                        Space::new(Length::Fill, Length::Fill),
+                                        owner_strip,
+                                    ]
+                                    .spacing(0)
+                                    .into(),
+                                    "top" => column![
+                                        owner_strip,
+                                        Space::new(Length::Fill, Length::Fill),
+                                        group_bar,
+                                    ]
+                                    .spacing(0)
+                                    .into(),
+                                    "right" => row![
+                                        group_bar,
+                                        Space::new(Length::Fill, Length::Fill),
+                                        owner_strip,
+                                    ]
+                                    .spacing(0)
+                                    .into(),
+                                    _ => row![
+                                        owner_strip,
+                                        Space::new(Length::Fill, Length::Fill),
+                                        group_bar,
+                                    ]
+                                    .spacing(0)
+                                    .into(),
+                                };
+
+                                container(bars)
+                                    .width(Length::Fixed(cell_size))
+                                    .height(Length::Fixed(cell_size))
+                                    .into()
                             };
 
-                            container(layered)
-                                .width(Length::Fixed(cell_size))
-                                .height(Length::Fixed(cell_size))
-                                .style(move |_| container::Style {
-                                    background: bg,
-                                    ..Default::default()
-                                })
-                                .into()
+                            stack![base_cell, overlay].into()
                         } else {
-                            container(inner_el)
-                                .width(Length::Fixed(cell_size))
-                                .height(Length::Fixed(cell_size))
-                                .style(move |_| container::Style {
-                                    background: bg,
-                                    ..Default::default()
-                                })
-                                .into()
+                            base_cell
                         };
-
                         cell_body
                     }
                 };
@@ -3371,65 +3626,72 @@ impl DreamBreaker {
                     vec![]
                 };
 
+                let max_slots = prop.max_upgrades.max(1) as usize;
+
                 panel_col = panel_col.push(text("Слоты усилений:").size(self.ts(10)));
                 panel_col = panel_col.push(Space::with_height(self.s(2.0)));
 
-                let mut slots_row = row![].spacing(self.s(4.0) as u16);
-                for slot_i in 0..3usize {
-                    let slot_el: Element<'_, Message> =
-                        if let Some((name, pu_id)) = installed.get(slot_i) {
-                            let pu_id = *pu_id;
-                            let prop_id = prop.property_id;
-                            let short = name.chars().take(10).collect::<String>();
-                            button(
-                                column![
-                                    text(short).size(self.ts(9)),
-                                    text("× извлечь").size(self.ts(8)),
-                                ]
-                                .align_x(Alignment::Center)
-                                .spacing(1),
-                            )
-                            .on_press(Message::UninstallUpgrade {
-                                property_id: prop_id,
-                                power_up_id: pu_id,
-                            })
-                            .padding(self.s(4.0) as u16)
-                            .width(Length::Fixed(self.s(74.0)))
-                            .style(|theme, status| {
-                                let base = button::primary(theme, status);
-                                button::Style {
-                                    background: Some(Background::Color(Color::from_rgba(
-                                        0.2, 0.4, 0.2, 0.9,
-                                    ))),
-                                    ..base
-                                }
-                            })
-                            .into()
-                        } else {
-                            container(text("— пусто —").size(self.ts(9)))
+                // Слоты по 3 в строку
+                let slots_per_row = 3usize;
+                for chunk_start in (0..max_slots).step_by(slots_per_row) {
+                    let mut slots_row = row![].spacing(self.s(4.0) as u16);
+                    for slot_i in chunk_start..(chunk_start + slots_per_row).min(max_slots) {
+                        let slot_el: Element<'_, Message> =
+                            if let Some((name, pu_id)) = installed.get(slot_i) {
+                                let pu_id = *pu_id;
+                                let prop_id = prop.property_id;
+                                let short = name.chars().take(10).collect::<String>();
+                                button(
+                                    column![
+                                        text(short).size(self.ts(9)),
+                                        text("× извлечь").size(self.ts(8)),
+                                    ]
+                                    .align_x(Alignment::Center)
+                                    .spacing(1),
+                                )
+                                .on_press(Message::UninstallUpgrade {
+                                    property_id: prop_id,
+                                    power_up_id: pu_id,
+                                })
+                                .padding(self.s(4.0) as u16)
                                 .width(Length::Fixed(self.s(74.0)))
-                                .height(Length::Fixed(self.s(40.0)))
-                                .align_x(iced::alignment::Horizontal::Center)
-                                .align_y(iced::alignment::Vertical::Center)
-                                .style(|_| container::Style {
-                                    background: Some(Background::Color(Color::from_rgba(
-                                        0.1, 0.1, 0.15, 0.6,
-                                    ))),
-                                    border: iced::Border {
-                                        color: Color::from_rgba(0.4, 0.4, 0.5, 0.4),
-                                        width: 1.0,
-                                        radius: 4.0.into(),
-                                    },
-                                    ..Default::default()
+                                .style(|theme, status| {
+                                    let base = button::primary(theme, status);
+                                    button::Style {
+                                        background: Some(Background::Color(Color::from_rgba(
+                                            0.2, 0.4, 0.2, 0.9,
+                                        ))),
+                                        ..base
+                                    }
                                 })
                                 .into()
-                        };
-                    slots_row = slots_row.push(slot_el);
+                            } else {
+                                container(text("— пусто —").size(self.ts(9)))
+                                    .width(Length::Fixed(self.s(74.0)))
+                                    .height(Length::Fixed(self.s(40.0)))
+                                    .align_x(iced::alignment::Horizontal::Center)
+                                    .align_y(iced::alignment::Vertical::Center)
+                                    .style(|_| container::Style {
+                                        background: Some(Background::Color(Color::from_rgba(
+                                            0.1, 0.1, 0.15, 0.6,
+                                        ))),
+                                        border: iced::Border {
+                                            color: Color::from_rgba(0.4, 0.4, 0.5, 0.4),
+                                            width: 1.0,
+                                            radius: 4.0.into(),
+                                        },
+                                        ..Default::default()
+                                    })
+                                    .into()
+                            };
+                        slots_row = slots_row.push(slot_el);
+                    }
+                    panel_col = panel_col.push(slots_row);
+                    panel_col = panel_col.push(Space::with_height(self.s(2.0)));
                 }
-                panel_col = panel_col.push(slots_row);
 
                 // Инвентарь для установки (только если есть свободный слот)
-                if installed.len() < 3 && !self.inventory.is_empty() {
+                if installed.len() < max_slots && !self.inventory.is_empty() {
                     panel_col = panel_col.push(Space::with_height(self.s(6.0)));
                     panel_col = panel_col.push(text("Установить из инвентаря:").size(self.ts(10)));
                     panel_col = panel_col.push(Space::with_height(self.s(2.0)));
@@ -3498,42 +3760,7 @@ impl DreamBreaker {
             })
             .into()
     }
-    fn view_property_mgmt_overlay(&self) -> Element<'_, Message> {
-        let content = self.view_property_mgmt();
-        let panel_width = self.s(300.0); // ширина панели
 
-        let card = container(content)
-            .width(Length::Fixed(panel_width))
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(Color::from_rgba(0.04, 0.04, 0.12, 0.96))),
-                border: iced::Border {
-                    color: Color::from_rgba(0.5, 0.7, 1.0, 0.7),
-                    width: 1.5,
-                    radius: 8.0.into(),
-                },
-                ..Default::default()
-            });
-
-        let overlay = container(
-            container(card)
-                .center_x(Length::Fill) // центрируем по горизонтали
-                .align_y(iced::alignment::Vertical::Top) // прижимаем к верху
-                .padding(iced::Padding {
-                    top: self.s(100.0), // отступ сверху
-                    ..Default::default()
-                }),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.65))), // затемнение
-            ..Default::default()
-        });
-
-        mouse_area(overlay)
-            .on_press(Message::TogglePropertyMgmt) // клик вне панели → закрыть
-            .into()
-    }
     fn view_game_over(&self) -> Element<'_, Message> {
         let sc = self.scale();
         let result = match &self.game_result {
