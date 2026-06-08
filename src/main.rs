@@ -126,12 +126,23 @@ struct DreamBreaker {
     bot_turn_names: Vec<String>,
     bot_turn_log: Vec<String>,
 
-    // Настройки
     // Тултип усиления
     tooltip_item: Option<TooltipItem>,
     tooltip_hover_start: Option<std::time::Instant>,
     tooltip_visible: bool,
     tooltip_locked: bool,
+
+    // Zoom/pan игрового поля
+    board_zoom: f32,
+    board_pan_x: f32,
+    board_pan_y: f32,
+    board_dragging: bool,
+    board_mouse_pos: (f32, f32),
+
+    // Наведение на клетку
+    hovered_cell: Option<i32>,
+
+    // Настройки
     window_mode: WindowMode,
 
     settings_from_game: bool,
@@ -183,6 +194,12 @@ impl Default for DreamBreaker {
             tooltip_hover_start: None,
             tooltip_visible: false,
             tooltip_locked: false,
+            board_zoom: 1.0,
+            board_pan_x: 0.0,
+            board_pan_y: 0.0,
+            board_dragging: false,
+            board_mouse_pos: (0.0, 0.0),
+            hovered_cell: None,
             window_mode: WindowMode::Window,
             settings_from_game: false,
             window_width: 1024.0,
@@ -290,6 +307,16 @@ enum Message {
     TooltipHoverStart(TooltipItem),
     TooltipHoverEnd,
     TooltipTick,
+    // Zoom/pan поля
+    BoardZoom(f32),
+    BoardScrollTo(iced::widget::scrollable::AbsoluteOffset),
+    BoardScrolled(iced::widget::scrollable::Viewport),
+    BoardDragStart,
+    BoardDragEnd,
+    BoardMouseMove(f32, f32),
+    // Наведение на клетку доски
+    CellHovered(Option<i32>),
+
     // Настройки
     SetWindowMode(WindowMode),
     WindowResized(f32, f32),
@@ -361,15 +388,7 @@ impl DreamBreaker {
             _ => None,
         });
 
-        if self.tooltip_hover_start.is_some() && !self.tooltip_visible {
-            Subscription::batch([
-                window_sub,
-                iced::time::every(std::time::Duration::from_millis(100))
-                    .map(|_| Message::TooltipTick),
-            ])
-        } else {
-            window_sub
-        }
+        window_sub
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -739,6 +758,9 @@ impl DreamBreaker {
                 self.bot_participants.clear();
                 self.show_property_mgmt = false;
                 self.selected_property = None;
+                self.board_zoom = 1.0;
+                self.board_pan_x = 0.0;
+                self.board_pan_y = 0.0;
                 Task::none()
             }
             Message::GameScreenLoaded(Err(e)) => {
@@ -842,37 +864,48 @@ impl DreamBreaker {
             }
             Message::TooltipHoverStart(item) => {
                 self.tooltip_item = Some(item);
-                self.tooltip_hover_start = Some(std::time::Instant::now());
-                self.tooltip_visible = false;
-                self.tooltip_locked = false;
+                self.tooltip_visible = true;
                 Task::none()
             }
             Message::TooltipHoverEnd => {
-                // Если тултип уже показан и залочен — не скрываем,
-                // пока мышь не уйдёт из самого тултипа
-                if !self.tooltip_locked {
-                    self.tooltip_item = None;
-                    self.tooltip_hover_start = None;
-                    self.tooltip_visible = false;
-                }
+                self.tooltip_item = None;
+                self.tooltip_visible = false;
                 Task::none()
             }
-            Message::TooltipTick => {
-                if let Some(start) = self.tooltip_hover_start {
-                    if start.elapsed() >= std::time::Duration::from_millis(1500) {
-                        self.tooltip_visible = true;
-                        self.tooltip_locked = true;
-                    }
-                }
-                Task::none()
-            }
+            Message::TooltipTick => Task::none(),
             Message::TooltipClose => {
                 self.tooltip_item = None;
-                self.tooltip_hover_start = None;
                 self.tooltip_visible = false;
-                self.tooltip_locked = false;
                 Task::none()
             }
+            Message::BoardZoom(delta) => {
+                self.board_zoom = (self.board_zoom + delta * 0.001).clamp(0.3, 4.0);
+                Task::none()
+            }
+            Message::BoardScrollTo(_) => Task::none(),
+            Message::BoardScrolled(_) => Task::none(),
+            Message::BoardDragStart => {
+                self.board_dragging = true;
+                Task::none()
+            }
+            Message::BoardDragEnd => {
+                self.board_dragging = false;
+                Task::none()
+            }
+            Message::BoardMouseMove(x, y) => {
+                let (ox, oy) = self.board_mouse_pos;
+                if self.board_dragging {
+                    self.board_pan_x += ox - x;
+                    self.board_pan_y += oy - y;
+                }
+                self.board_mouse_pos = (x, y);
+                Task::none()
+            }
+            Message::CellHovered(idx) => {
+                self.hovered_cell = idx;
+                Task::none()
+            }
+
             // ── Настройки ──────────────────────────────────
             Message::SetWindowMode(mode) => {
                 self.window_mode = mode;
@@ -1898,12 +1931,7 @@ impl DreamBreaker {
             with_stats
         };
 
-        if self.tooltip_visible {
-            let tip = self.view_tooltip_overlay();
-            stack![with_shop, tip].into()
-        } else {
-            with_shop
-        }
+        with_shop
     }
 
     fn view_header(&self) -> Element<'_, Message> {
@@ -2653,7 +2681,24 @@ impl DreamBreaker {
                 let item = &self.inventory[slot];
                 let label = short_label(item);
                 let pu_id = item.power_up_id;
-                column![
+                let tip_item = TooltipItem {
+                    name: item.name.clone(),
+                    description: String::new(),
+                    effect_type: item
+                        .effect
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    effect_value: item
+                        .effect
+                        .get("value")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    buy_cost: None,
+                    sell_cost: None,
+                };
+                let cell_inner: Element<'_, Message> = column![
                     container(text(label).size(fs_inv))
                         .width(Length::Fixed(slot_size))
                         .height(Length::Fixed(slot_size))
@@ -2678,11 +2723,15 @@ impl DreamBreaker {
                 ]
                 .align_x(Alignment::Center)
                 .spacing(self.s(2.0) as u16)
-                .into()
+                .into();
+                mouse_area(cell_inner)
+                    .on_enter(Message::TooltipHoverStart(tip_item))
+                    .on_exit(Message::TooltipHoverEnd)
+                    .into()
             } else {
-                container(text("—").size(self.ts(13)))
-                    .width(Length::Fixed(slot_size))
-                    .height(Length::Fixed(slot_size))
+                container(text("— пусто —").size(self.ts(9)))
+                    .width(Length::Fixed(self.s(80.0)))
+                    .height(Length::Fixed(self.s(40.0)))
                     .padding(self.s(3.0) as u16)
                     .align_x(iced::alignment::Horizontal::Center)
                     .align_y(iced::alignment::Vertical::Center)
@@ -2921,7 +2970,7 @@ impl DreamBreaker {
         // ── Центр: игровое поле + оверлей кубика ─────────────────────────
         let board = self.view_board(self.local_player_pos);
 
-        // Оверлей кубика и действия — по центру внизу поля
+        // Оверлей кубика и действия — по центру поля
         let mut center_overlay_col = column![]
             .spacing(self.s(6.0) as u16)
             .align_x(Alignment::Center);
@@ -2938,7 +2987,78 @@ impl DreamBreaker {
             .align_y(iced::alignment::Vertical::Center)
             .into();
 
-        let board_with_overlay: Element<'_, Message> = stack![board, center_overlay].into();
+        // Карточка собственности при наведении
+        let cell_card_overlay: Element<'_, Message> = if let Some(idx) = self.hovered_cell {
+            if let Some(cell) = self.board_cells.iter().find(|c| c.cell_index == idx) {
+                let upg = self
+                    .player_properties
+                    .iter()
+                    .find(|p| p.cell_index == idx)
+                    .map(|p| p.upgrades_count)
+                    .unwrap_or(0);
+
+                let owner_label = if let Some(owner_id) = cell.owner_user_id {
+                    if self.current_user.as_ref().map(|(id, _)| *id) == Some(owner_id) {
+                        "Ваша".to_string()
+                    } else {
+                        self.bot_participants
+                            .iter()
+                            .find(|b| b.user_id == owner_id)
+                            .map(|b| b.username.clone())
+                            .unwrap_or_else(|| "Чужая".to_string())
+                    }
+                } else {
+                    "Свободна".to_string()
+                };
+
+                let card_col = column![
+                    text(cell.prop_name.as_deref().unwrap_or("?")).size(self.ts(15)),
+                    Space::with_height(self.s(6.0)),
+                    text(format!("Владелец: {}", owner_label)).size(self.ts(12)),
+                    text(format!("Цена: {}", cell.purchase_cost.unwrap_or(0))).size(self.ts(12)),
+                    text(format!("Аренда: {}", cell.rent_cost.unwrap_or(0))).size(self.ts(12)),
+                    text(format!("Улучшений: {}", upg)).size(self.ts(12)),
+                ]
+                .spacing(self.s(3.0) as u16)
+                .padding(self.s(12.0) as u16);
+
+                let card = container(card_col)
+                    .width(Length::Fixed(self.s(200.0)))
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(Color::from_rgba(
+                            0.05, 0.05, 0.18, 0.96,
+                        ))),
+                        border: iced::Border {
+                            color: Color::from_rgba(0.5, 0.5, 1.0, 0.7),
+                            width: 1.0,
+                            radius: 8.0.into(),
+                        },
+                        ..Default::default()
+                    });
+
+                container(card)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Right)
+                    .align_y(iced::alignment::Vertical::Bottom)
+                    .padding(iced::Padding {
+                        bottom: self.s(40.0),
+                        right: self.s(16.0),
+                        top: 0.0,
+                        left: 0.0,
+                    })
+                    .into()
+            } else {
+                Space::new(Length::Shrink, Length::Shrink).into()
+            }
+        } else {
+            Space::new(Length::Shrink, Length::Shrink).into()
+        };
+
+        let board_with_overlay: Element<'_, Message> = stack![board, center_overlay]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
 
         // ── Правая панель: статус ботов + лог ────────────────────────────
         let mut right_col = column![]
@@ -3020,6 +3140,52 @@ impl DreamBreaker {
             );
         }
 
+        // Карточка усиления при наведении
+        if self.tooltip_visible {
+            if let Some(item) = &self.tooltip_item {
+                let mut tip_col = column![
+                    text(&item.name).size(self.ts(13)),
+                    Space::with_height(self.s(4.0)),
+                    text(&item.description).size(self.ts(11)),
+                ]
+                .spacing(self.s(2.0) as u16);
+
+                if !item.effect_type.is_empty() {
+                    let effect_str = match item.effect_type.as_str() {
+                        "flat_base" => format!("+{} к базовой аренде", item.effect_value),
+                        "percent_bonus" => format!("+{}% к аренде", item.effect_value),
+                        "flat_final" => format!("+{} к итоговой аренде", item.effect_value),
+                        other => other.to_string(),
+                    };
+                    tip_col =
+                        tip_col.push(text(format!("Эффект: {}", effect_str)).size(self.ts(11)));
+                }
+                if let Some(buy) = item.buy_cost {
+                    tip_col = tip_col.push(text(format!("Цена: {}", buy)).size(self.ts(11)));
+                }
+                if let Some(sell) = item.sell_cost {
+                    tip_col = tip_col.push(text(format!("Продажа: {}", sell)).size(self.ts(11)));
+                }
+
+                right_col = right_col.push(
+                    container(tip_col)
+                        .padding(self.s(8.0))
+                        .width(Length::Fixed(self.s(200.0)))
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(
+                                0.05, 0.18, 0.05, 0.96,
+                            ))),
+                            border: iced::Border {
+                                color: Color::from_rgba(0.3, 0.8, 0.3, 0.7),
+                                width: 1.0,
+                                radius: 6.0.into(),
+                            },
+                            ..Default::default()
+                        }),
+                );
+            }
+        }
+
         // Лог ходов ботов
         if !self.bot_turn_log.is_empty() {
             let mut log_col = column![text("Ходы ботов:").size(self.ts(11))].spacing(2);
@@ -3042,16 +3208,85 @@ impl DreamBreaker {
             );
         }
 
-        let right_panel: Element<'_, Message> = container(right_col)
-            .padding(self.s(8.0))
-            .width(Length::Fixed(self.s(200.0)))
-            .height(Length::Fill)
-            .align_y(iced::alignment::Vertical::Top)
-            .style(|_| container::Style {
-                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.05, 0.7))),
-                ..Default::default()
-            })
-            .into();
+        // ── Правая нижняя: карточка собственности / усиления ─────────────
+        let mut info_col = column![].spacing(self.s(6.0) as u16);
+
+        // Карточка собственности при наведении
+        if let Some(idx) = self.hovered_cell {
+            if let Some(cell) = self.board_cells.iter().find(|c| c.cell_index == idx) {
+                let upg = self
+                    .player_properties
+                    .iter()
+                    .find(|p| p.cell_index == idx)
+                    .map(|p| p.upgrades_count)
+                    .unwrap_or(0);
+
+                let owner_label = if let Some(owner_id) = cell.owner_user_id {
+                    if self.current_user.as_ref().map(|(id, _)| *id) == Some(owner_id) {
+                        "Ваша".to_string()
+                    } else {
+                        self.bot_participants
+                            .iter()
+                            .find(|b| b.user_id == owner_id)
+                            .map(|b| b.username.clone())
+                            .unwrap_or_else(|| "Чужая".to_string())
+                    }
+                } else {
+                    "Свободна".to_string()
+                };
+
+                let card_col = column![
+                    text(cell.prop_name.as_deref().unwrap_or("?")).size(self.ts(13)),
+                    Space::with_height(self.s(4.0)),
+                    text(format!("Владелец: {}", owner_label)).size(self.ts(11)),
+                    text(format!("Цена: {}", cell.purchase_cost.unwrap_or(0))).size(self.ts(11)),
+                    text(format!("Аренда: {}", cell.rent_cost.unwrap_or(0))).size(self.ts(11)),
+                    text(format!("Улучшений: {}", upg)).size(self.ts(11)),
+                ]
+                .spacing(self.s(2.0) as u16);
+
+                info_col = info_col.push(
+                    container(card_col)
+                        .padding(self.s(8.0))
+                        .width(Length::Fixed(self.s(184.0)))
+                        .style(|_| container::Style {
+                            background: Some(Background::Color(Color::from_rgba(
+                                0.05, 0.05, 0.18, 0.96,
+                            ))),
+                            border: iced::Border {
+                                color: Color::from_rgba(0.5, 0.5, 1.0, 0.7),
+                                width: 1.0,
+                                radius: 6.0.into(),
+                            },
+                            ..Default::default()
+                        }),
+                );
+            }
+        }
+
+        let right_panel: Element<'_, Message> = container(
+            column![
+                // Верхняя половина — боты и лог
+                container(right_col)
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(1)),
+                // Нижняя половина — карточки
+                container(info_col)
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(1))
+                    .align_y(iced::alignment::Vertical::Bottom),
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill),
+        )
+        .padding(self.s(8.0))
+        .width(Length::Fixed(self.s(200.0)))
+        .height(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.05, 0.7))),
+            ..Default::default()
+        })
+        .into();
 
         // ── Финальная сборка ─────────────────────────────────────────────
         row![left_panel, board_with_overlay, right_panel]
@@ -3090,7 +3325,6 @@ impl DreamBreaker {
             self.board_cells.iter().map(|c| (c.cell_index, c)).collect();
 
         let available_h = self.window_height - self.s(40.0) - self.s(28.0);
-        // Вычитаем ширину левой (~310) и правой (~220) панелей с отступами
         let left_panel_w = self.s(310.0) + self.s(16.0);
         let right_panel_w = self.s(200.0) + self.s(16.0);
         let available_w = (self.window_width - left_panel_w - right_panel_w).max(100.0);
@@ -3516,7 +3750,20 @@ impl DreamBreaker {
                         } else {
                             base_cell
                         };
-                        cell_body
+                        // Для property-клеток — mouse_area для карточки наведения
+                        let is_prop = cell_map
+                            .get(&idx)
+                            .map(|c| c.cell_type.as_str() == "property")
+                            .unwrap_or(false);
+
+                        if is_prop {
+                            mouse_area(cell_body)
+                                .on_enter(Message::CellHovered(Some(idx)))
+                                .on_exit(Message::CellHovered(None))
+                                .into()
+                        } else {
+                            cell_body
+                        }
                     }
                 };
                 board_row = board_row.push(cell_elem);
@@ -3641,7 +3888,15 @@ impl DreamBreaker {
                                 let pu_id = *pu_id;
                                 let prop_id = prop.property_id;
                                 let short = name.chars().take(10).collect::<String>();
-                                button(
+                                let tip = TooltipItem {
+                                    name: name.clone(),
+                                    description: String::new(),
+                                    effect_type: String::new(),
+                                    effect_value: 0,
+                                    buy_cost: None,
+                                    sell_cost: None,
+                                };
+                                let btn: Element<'_, Message> = button(
                                     column![
                                         text(short).size(self.ts(9)),
                                         text("× извлечь").size(self.ts(8)),
@@ -3654,7 +3909,7 @@ impl DreamBreaker {
                                     power_up_id: pu_id,
                                 })
                                 .padding(self.s(4.0) as u16)
-                                .width(Length::Fixed(self.s(74.0)))
+                                .width(Length::Fixed(self.s(80.0)))
                                 .style(|theme, status| {
                                     let base = button::primary(theme, status);
                                     button::Style {
@@ -3664,10 +3919,14 @@ impl DreamBreaker {
                                         ..base
                                     }
                                 })
-                                .into()
+                                .into();
+                                mouse_area(btn)
+                                    .on_enter(Message::TooltipHoverStart(tip))
+                                    .on_exit(Message::TooltipHoverEnd)
+                                    .into()
                             } else {
                                 container(text("— пусто —").size(self.ts(9)))
-                                    .width(Length::Fixed(self.s(74.0)))
+                                    .width(Length::Fixed(self.s(80.0)))
                                     .height(Length::Fixed(self.s(40.0)))
                                     .align_x(iced::alignment::Horizontal::Center)
                                     .align_y(iced::alignment::Vertical::Center)
@@ -3696,53 +3955,60 @@ impl DreamBreaker {
                     panel_col = panel_col.push(text("Установить из инвентаря:").size(self.ts(10)));
                     panel_col = panel_col.push(Space::with_height(self.s(2.0)));
 
-                    let mut inv_install_row = row![].spacing(self.s(3.0) as u16);
                     let prop_id = prop.property_id;
-                    for item in &self.inventory {
-                        let pu_id = item.power_up_id;
-                        let already = installed.iter().any(|(_, id)| *id == pu_id);
-                        let short = item
-                            .name
-                            .split(':')
-                            .last()
-                            .unwrap_or(&item.name)
-                            .trim()
-                            .chars()
-                            .take(10)
-                            .collect::<String>();
-                        let inv_btn: Element<'_, Message> = if already {
-                            container(text(short).size(self.ts(9)))
-                                .width(Length::Fixed(self.s(74.0)))
-                                .height(Length::Fixed(self.s(36.0)))
-                                .align_x(iced::alignment::Horizontal::Center)
-                                .align_y(iced::alignment::Vertical::Center)
-                                .style(|_| container::Style {
-                                    background: Some(Background::Color(Color::from_rgba(
-                                        0.2, 0.2, 0.2, 0.5,
-                                    ))),
-                                    ..Default::default()
+                    let items_per_row = 3usize;
+                    let inv_items: Vec<_> = self.inventory.iter().collect();
+                    for chunk_start in (0..inv_items.len()).step_by(items_per_row) {
+                        let mut inv_row = row![].spacing(self.s(3.0) as u16);
+                        for item in &inv_items
+                            [chunk_start..(chunk_start + items_per_row).min(inv_items.len())]
+                        {
+                            let pu_id = item.power_up_id;
+                            let already = installed.iter().any(|(_, id)| *id == pu_id);
+                            let short = item
+                                .name
+                                .split(':')
+                                .last()
+                                .unwrap_or(&item.name)
+                                .trim()
+                                .chars()
+                                .take(10)
+                                .collect::<String>();
+                            let inv_btn: Element<'_, Message> = if already {
+                                container(text(short).size(self.ts(9)))
+                                    .width(Length::Fixed(self.s(80.0)))
+                                    .height(Length::Fixed(self.s(36.0)))
+                                    .align_x(iced::alignment::Horizontal::Center)
+                                    .align_y(iced::alignment::Vertical::Center)
+                                    .style(|_| container::Style {
+                                        background: Some(Background::Color(Color::from_rgba(
+                                            0.2, 0.2, 0.2, 0.5,
+                                        ))),
+                                        ..Default::default()
+                                    })
+                                    .into()
+                            } else {
+                                button(
+                                    column![
+                                        text(short).size(self.ts(9)),
+                                        text(format!("×{}", item.quantity)).size(self.ts(8)),
+                                    ]
+                                    .align_x(Alignment::Center)
+                                    .spacing(1),
+                                )
+                                .on_press(Message::InstallUpgrade {
+                                    property_id: prop_id,
+                                    power_up_id: pu_id,
                                 })
+                                .padding(self.s(4.0) as u16)
+                                .width(Length::Fixed(self.s(80.0)))
                                 .into()
-                        } else {
-                            button(
-                                column![
-                                    text(short).size(self.ts(9)),
-                                    text(format!("×{}", item.quantity)).size(self.ts(8)),
-                                ]
-                                .align_x(Alignment::Center)
-                                .spacing(1),
-                            )
-                            .on_press(Message::InstallUpgrade {
-                                property_id: prop_id,
-                                power_up_id: pu_id,
-                            })
-                            .padding(self.s(4.0) as u16)
-                            .width(Length::Fixed(self.s(74.0)))
-                            .into()
-                        };
-                        inv_install_row = inv_install_row.push(inv_btn);
+                            };
+                            inv_row = inv_row.push(inv_btn);
+                        }
+                        panel_col = panel_col.push(inv_row);
+                        panel_col = panel_col.push(Space::with_height(self.s(2.0)));
                     }
-                    panel_col = panel_col.push(inv_install_row);
                 }
             }
         }
