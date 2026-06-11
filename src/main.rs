@@ -1,4 +1,5 @@
 mod db;
+use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{
     button, column, container, mouse_area, pick_list, row, scrollable, stack, svg, text,
     text_input, Button, Space,
@@ -142,6 +143,7 @@ struct DreamBreaker {
 
     // Лог пополнений баланса игрока
     income_log: Vec<String>,
+    start_log: Vec<String>,
 
     // Наведение на клетку
     hovered_cell: Option<i32>,
@@ -204,6 +206,7 @@ impl Default for DreamBreaker {
             board_dragging: false,
             board_mouse_pos: (0.0, 0.0),
             income_log: vec![],
+            start_log: vec![],
             hovered_cell: None,
             window_mode: WindowMode::Window,
             settings_from_game: false,
@@ -309,6 +312,7 @@ enum Message {
     // Боты
     BotsLoaded(Result<Vec<db::BotParticipant>, db::DbError>),
     BotsRefreshed(Result<Vec<db::BotParticipant>, db::DbError>), // только обновить позиции, без запуска ходов
+    PlayerStateRefreshed(Result<Option<db::ParticipantState>, db::DbError>),
     BotTurnDone(Result<db::BotTurnResult, db::DbError>),
     TooltipHoverStart(TooltipItem),
     TooltipHoverEnd,
@@ -1035,6 +1039,8 @@ impl DreamBreaker {
                 if self.turn_phase != TurnPhase::WaitingRoll {
                     return Task::none();
                 }
+                self.income_log.clear();
+                self.start_log.clear();
                 if let (Some(state), Some(rules)) = (&self.player_state, &self.game_rules) {
                     if state.moves_made >= rules.max_turns {
                         return Task::none();
@@ -1519,28 +1525,24 @@ impl DreamBreaker {
                     "Ход завершён. Боты ходят...".to_string()
                 };
 
-                self.income_log.clear();
-                if balance_diff >= 400 {
-                    self.income_log
-                        .push(format!("Встали на СТАРТ: +{}", balance_diff));
-                } else if balance_diff >= 200 {
-                    self.income_log
-                        .push(format!("Прошли СТАРТ: +{}", balance_diff));
-                } else if balance_diff > 0 {
-                    self.income_log
-                        .push(format!("Доход за ход: +{}", balance_diff));
-                }
-
-                // Сбрасываем лог перед новым раундом ботов
                 self.bot_turn_log.clear();
-                // Обновляем лог пополнений
-                self.income_log.clear();
-                if balance_diff >= 400 {
-                    self.income_log
-                        .push(format!("Встали на СТАРТ: +{}", balance_diff));
-                } else if balance_diff >= 200 {
-                    self.income_log
-                        .push(format!("Прошли СТАРТ: +{}", balance_diff));
+                self.start_log.clear();
+                // income_log не чистим — там уже лежит аренда/налог этого хода
+                // Бонус СТАРТ фиксированный: 400 за приземление, 200 за прохождение.
+                // balance_diff ненадёжен если до этого была аренда/налог — проверяем позицию.
+                let start_bonus = if new_state.position == 0 && old_balance > 0 {
+                    400i64
+                } else if old_balance > 0 && new_state.position < self.local_player_pos {
+                    200i64
+                } else {
+                    0i64
+                };
+                if start_bonus == 400 {
+                    self.start_log
+                        .push(format!("Встали на СТАРТ: +{}", start_bonus));
+                } else if start_bonus == 200 {
+                    self.start_log
+                        .push(format!("Прошли СТАРТ: +{}", start_bonus));
                 }
 
                 let game_id = match self.active_game_id {
@@ -1601,10 +1603,17 @@ impl DreamBreaker {
                 }
 
                 // Ботов нет — сразу проверяем балансы
-                Task::perform(
-                    async move { db::get_all_balances(&pool, game_id).await },
-                    Message::BalancesLoaded,
-                )
+                let pool2 = pool.clone();
+                Task::batch([
+                    Task::perform(
+                        async move { db::get_all_balances(&pool, game_id).await },
+                        Message::BalancesLoaded,
+                    ),
+                    Task::perform(
+                        async move { db::get_bot_participants(&pool2, game_id).await },
+                        Message::BotsRefreshed,
+                    ),
+                ])
             }
             Message::BotsLoaded(Err(e)) => {
                 self.status = format!("Ошибка загрузки ботов: {}", e.0);
@@ -1626,6 +1635,12 @@ impl DreamBreaker {
                 Task::none()
             }
             Message::BotsRefreshed(Err(_)) => Task::none(),
+            Message::PlayerStateRefreshed(Ok(Some(state))) => {
+                self.player_state = Some(state);
+                Task::none()
+            }
+            Message::PlayerStateRefreshed(Ok(None)) => Task::none(),
+            Message::PlayerStateRefreshed(Err(_)) => Task::none(),
             Message::BotTurnDone(Ok(result)) => {
                 // Извлекаем имя текущего бота из головы очереди имён
                 let bot_name = if !self.bot_turn_names.is_empty() {
@@ -1692,6 +1707,8 @@ impl DreamBreaker {
                 // Все боты походили — обновляем поле, позиции ботов и проверяем балансы
                 self.status = "Ходы ботов завершены".to_string();
                 let pool3 = pool.clone();
+                let pool4 = pool.clone();
+                let uid_for_refresh = self.current_user.as_ref().map(|(id, _)| *id);
                 Task::batch([
                     Task::perform(
                         {
@@ -1707,6 +1724,16 @@ impl DreamBreaker {
                     Task::perform(
                         async move { db::get_bot_participants(&pool3, game_id).await },
                         Message::BotsRefreshed,
+                    ),
+                    Task::perform(
+                        async move {
+                            if let Some(uid) = uid_for_refresh {
+                                db::get_participant_state(&pool4, game_id, uid).await
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                        Message::PlayerStateRefreshed,
                     ),
                 ])
             }
@@ -1868,6 +1895,12 @@ impl DreamBreaker {
                 Task::none()
             }
             Message::RentPaid(Ok(new_state)) => {
+                if let (Some(old),) = (self.player_state.as_ref(),) {
+                    let diff = old.balance - new_state.balance;
+                    if diff > 0 {
+                        self.income_log.push(format!("Аренда: -{}", diff));
+                    }
+                }
                 self.player_state = Some(new_state);
                 self.status = "Аренда уплачена, завершаю ход...".to_string();
                 self.cell_action = None;
@@ -1895,6 +1928,12 @@ impl DreamBreaker {
                 Task::none()
             }
             Message::TaxPaid(Ok(new_state)) => {
+                if let Some(old) = self.player_state.as_ref() {
+                    let diff = old.balance - new_state.balance;
+                    if diff > 0 {
+                        self.income_log.push(format!("Налог: -{}", diff));
+                    }
+                }
                 self.player_state = Some(new_state);
                 self.status = "Налог уплачен, завершаю ход...".to_string();
                 self.cell_action = None;
@@ -3065,42 +3104,71 @@ impl DreamBreaker {
             .into();
 
         // Лог дохода — отдельный оверлей, прибитый к низу центра, не сдвигает кнопку
-        let income_overlay: Element<'_, Message> = if self.income_log.is_empty() {
+        // Вспомогательное замыкание для одного badge-сообщения
+        let make_badge = |msg: &str,
+                          bg: (f32, f32, f32),
+                          border: (f32, f32, f32)|
+         -> Element<'_, Message> {
+            container(text(msg.to_string()).size(self.ts(13)))
+                .padding(iced::Padding {
+                    top: self.s(4.0),
+                    bottom: self.s(4.0),
+                    left: self.s(10.0),
+                    right: self.s(10.0),
+                })
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(Color::from_rgba(bg.0, bg.1, bg.2, 0.9))),
+                    border: iced::Border {
+                        color: Color::from_rgba(border.0, border.1, border.2, 0.7),
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into()
+        };
+
+        // Блок СТАРТ — центр поля
+        let start_overlay: Element<'_, Message> = if self.start_log.is_empty() {
             Space::new(Length::Shrink, Length::Shrink).into()
         } else {
-            let mut income_col = column![]
+            let mut col = column![]
                 .spacing(self.s(3.0) as u16)
                 .align_x(Alignment::Center);
-            for msg in &self.income_log {
-                let m = msg.clone();
-                income_col = income_col.push(
-                    container(text(m).size(self.ts(13)))
-                        .padding(iced::Padding {
-                            top: self.s(4.0),
-                            bottom: self.s(4.0),
-                            left: self.s(10.0),
-                            right: self.s(10.0),
-                        })
-                        .style(|_| container::Style {
-                            background: Some(Background::Color(Color::from_rgba(
-                                0.1, 0.35, 0.1, 0.9,
-                            ))),
-                            border: iced::Border {
-                                color: Color::from_rgba(0.3, 0.8, 0.3, 0.7),
-                                width: 1.0,
-                                radius: 4.0.into(),
-                            },
-                            ..Default::default()
-                        }),
-                );
+            for msg in &self.start_log {
+                col = col.push(make_badge(msg, (0.1, 0.35, 0.1), (0.3, 0.8, 0.3)));
             }
-            container(income_col)
+            container(col)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .align_x(iced::alignment::Horizontal::Center)
                 .align_y(iced::alignment::Vertical::Center)
                 .padding(iced::Padding {
                     top: self.s(120.0),
+                    bottom: 0.0,
+                    left: 0.0,
+                    right: 0.0,
+                })
+                .into()
+        };
+
+        // Блок прочих событий — чуть ниже СТАРТ
+        let income_overlay: Element<'_, Message> = if self.income_log.is_empty() {
+            Space::new(Length::Shrink, Length::Shrink).into()
+        } else {
+            let mut col = column![]
+                .spacing(self.s(3.0) as u16)
+                .align_x(Alignment::Center);
+            for msg in &self.income_log {
+                col = col.push(make_badge(msg, (0.25, 0.1, 0.1), (0.8, 0.3, 0.3)));
+            }
+            container(col)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center)
+                .padding(iced::Padding {
+                    top: self.s(160.0),
                     bottom: 0.0,
                     left: 0.0,
                     right: 0.0,
@@ -3251,7 +3319,7 @@ impl DreamBreaker {
         };
 
         let center_overlay: Element<'_, Message> =
-            stack![dice_overlay, action_overlay, income_overlay]
+            stack![dice_overlay, action_overlay, start_overlay, income_overlay]
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();
@@ -3582,13 +3650,11 @@ impl DreamBreaker {
                 .push((pid, Color::WHITE));
         }
         for bot in &self.bot_participants {
-            if bot.balance > 0 {
-                let c = participant_color(bot.user_id);
-                occupants
-                    .entry(bot.position)
-                    .or_default()
-                    .push((bot.user_id, c));
-            }
+            let c = participant_color(bot.user_id);
+            occupants
+                .entry(bot.position)
+                .or_default()
+                .push((bot.user_id, c));
         }
 
         // cell_index → upgrades_count для собственностей игрока
@@ -4082,10 +4148,18 @@ impl DreamBreaker {
             prop_list = prop_list.push(prop_btn);
         }
 
+        let prop_scroll = scrollable(prop_list)
+            .direction(Direction::Horizontal(
+                Scrollbar::new()
+                    .width(self.s(4.0) as u16)
+                    .scroller_width(self.s(4.0) as u16),
+            ))
+            .width(Length::Fixed(panel_w));
+
         let mut panel_col = column![
             text("Управление объектами").size(self.ts(11)),
             Space::with_height(self.s(4.0)),
-            prop_list,
+            prop_scroll,
         ]
         .spacing(self.s(4.0) as u16);
 
