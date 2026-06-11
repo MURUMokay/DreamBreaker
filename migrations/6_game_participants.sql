@@ -4,7 +4,7 @@ CREATE TABLE game_participants (
     game_id UUID NOT NULL REFERENCES games(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     position INT NOT NULL DEFAULT 0,                -- Текущая позиция
-    balance BIGINT NOT NULL DEFAULT 1000,           -- Баланс (ТЗ п.2.3.6)
+    balance BIGINT NOT NULL DEFAULT 1000,           -- Баланс
     moves_made INT NOT NULL DEFAULT 0,              -- Сделано ходов
     total_spent BIGINT NOT NULL DEFAULT 0,          -- Потрачено
     total_earned BIGINT NOT NULL DEFAULT 0,         -- Получено
