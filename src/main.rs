@@ -144,6 +144,7 @@ struct DreamBreaker {
     // Лог пополнений баланса игрока
     income_log: Vec<String>,
     start_log: Vec<String>,
+    rent_received_log: Vec<String>,
 
     // Наведение на клетку
     hovered_cell: Option<i32>,
@@ -207,6 +208,7 @@ impl Default for DreamBreaker {
             board_mouse_pos: (0.0, 0.0),
             income_log: vec![],
             start_log: vec![],
+            rent_received_log: vec![],
             hovered_cell: None,
             window_mode: WindowMode::Window,
             settings_from_game: false,
@@ -236,6 +238,7 @@ enum Screen {
 enum Message {
     // Навигация
     OpenLogin,
+    StaleGamesReset,
     OpenRegister,
     OpenLoadGame,
     OpenCreateGame,
@@ -562,6 +565,7 @@ impl DreamBreaker {
                 self.has_active_game = None;
                 if let Some(pool) = self.pool.clone() {
                     let pool2 = pool.clone();
+                    let pool3 = pool.clone();
                     Task::batch([
                         Task::perform(
                             async move { db::list_users(&pool).await },
@@ -570,6 +574,12 @@ impl DreamBreaker {
                         Task::perform(
                             async move { db::get_active_game_for_user(&pool2, user_id).await },
                             Message::ActiveGameChecked,
+                        ),
+                        Task::perform(
+                            async move {
+                                let _ = db::reset_stale_active_games(&pool3, user_id).await;
+                            },
+                            |_| Message::StaleGamesReset,
                         ),
                     ])
                 } else {
@@ -615,13 +625,24 @@ impl DreamBreaker {
                     Task::none()
                 }
             }
-            Message::RegisterDone(Ok(_)) => {
+            Message::RegisterDone(Ok(new_user_id)) => {
                 self.status = "Аккаунт создан!".to_string();
-                self.screen = Screen::Login;
-                self.input_password = String::new();
-                self.input_password2 = String::new();
-                self.form_error = String::new();
-                Task::none()
+                self.clear_form();
+                if let Some(pool) = self.pool.clone() {
+                    Task::perform(
+                        async move { db::get_user_by_id(&pool, new_user_id).await },
+                        |res| match res {
+                            Ok(Some(user)) => Message::LoginDone(Ok(user)),
+                            Ok(None) => Message::LoginDone(Err(db::DbError(
+                                "Пользователь не найден".to_string(),
+                            ))),
+                            Err(e) => Message::LoginDone(Err(e)),
+                        },
+                    )
+                } else {
+                    self.screen = Screen::Login;
+                    Task::none()
+                }
             }
             Message::RegisterDone(Err(e)) => {
                 if e.0.contains("duplicate") || e.0.contains("unique") {
@@ -1041,6 +1062,7 @@ impl DreamBreaker {
                 }
                 self.income_log.clear();
                 self.start_log.clear();
+                self.rent_received_log.clear();
                 if let (Some(state), Some(rules)) = (&self.player_state, &self.game_rules) {
                     if state.moves_made >= rules.max_turns {
                         return Task::none();
@@ -1196,6 +1218,9 @@ impl DreamBreaker {
                 ])
             }
             Message::ShopSlotBought(Err(e)) => {
+                if Self::is_game_over_error(&e) {
+                    return self.force_exit_to_menu("Игра уже завершена");
+                }
                 self.status = format!("Ошибка покупки: {}", e.0);
                 Task::none()
             }
@@ -1249,6 +1274,9 @@ impl DreamBreaker {
                 )
             }
             Message::PowerUpSold(Err(e)) => {
+                if Self::is_game_over_error(&e) {
+                    return self.force_exit_to_menu("Игра уже завершена");
+                }
                 self.status = format!("Ошибка продажи: {}", e.0);
                 Task::none()
             }
@@ -1458,6 +1486,9 @@ impl DreamBreaker {
                 )
             }
             Message::ShopRerolled(Err(e)) => {
+                if Self::is_game_over_error(&e) {
+                    return self.force_exit_to_menu("Игра уже завершена");
+                }
                 self.status = format!("Ошибка реролла: {}", e.0);
                 Task::none()
             }
@@ -1527,6 +1558,7 @@ impl DreamBreaker {
 
                 self.bot_turn_log.clear();
                 self.start_log.clear();
+                self.rent_received_log.clear();
                 // income_log не чистим — там уже лежит аренда/налог этого хода
                 // Бонус СТАРТ фиксированный: 400 за приземление, 200 за прохождение.
                 // balance_diff ненадёжен если до этого была аренда/налог — проверяем позицию.
@@ -1653,11 +1685,20 @@ impl DreamBreaker {
                     "bought" => format!("купил «{}»", result.action_detail),
                     "rent_paid" => {
                         let parts: Vec<&str> = result.action_detail.splitn(2, ':').collect();
-                        format!(
-                            "заплатил аренду {} за «{}»",
-                            parts.get(1).unwrap_or(&"?"),
-                            parts.first().unwrap_or(&"?")
-                        )
+                        let cell_name = parts.first().copied().unwrap_or("?");
+                        let amount = parts.get(1).copied().unwrap_or("?");
+                        // Если владелец клетки — игрок, фиксируем доход
+                        if let Some((user_id, _)) = &self.current_user {
+                            let is_player_owner = self.board_cells.iter().any(|c| {
+                                c.prop_name.as_deref() == Some(cell_name)
+                                    && c.owner_user_id == Some(*user_id)
+                            });
+                            if is_player_owner {
+                                self.rent_received_log
+                                    .push(format!("Аренда от {}: +{}", bot_name, amount));
+                            }
+                        }
+                        format!("заплатил аренду {} за «{}»", amount, cell_name)
                     }
                     "tax_paid" => format!("заплатил налог {}", result.action_detail),
                     "bankrupt" => format!("💀 БАНКРОТ ({})", result.action_detail),
@@ -1779,6 +1820,9 @@ impl DreamBreaker {
                 )
             }
             Message::TurnSaved(Err(e)) => {
+                if Self::is_game_over_error(&e) {
+                    return self.force_exit_to_menu("Игра уже завершена");
+                }
                 self.status = format!("Ошибка сохранения хода: {}", e.0);
                 Task::none()
             }
@@ -1891,6 +1935,9 @@ impl DreamBreaker {
                 )
             }
             Message::PropertyBought(Err(e)) => {
+                if Self::is_game_over_error(&e) {
+                    return self.force_exit_to_menu("Игра уже завершена");
+                }
                 self.status = format!("Ошибка покупки: {}", e.0);
                 Task::none()
             }
@@ -1924,6 +1971,9 @@ impl DreamBreaker {
                 )
             }
             Message::RentPaid(Err(e)) => {
+                if Self::is_game_over_error(&e) {
+                    return self.force_exit_to_menu("Игра уже завершена");
+                }
                 self.status = format!("Ошибка аренды: {}", e.0);
                 Task::none()
             }
@@ -1957,10 +2007,9 @@ impl DreamBreaker {
                 )
             }
             Message::TaxPaid(Err(e)) => {
-                self.status = format!("Ошибка налога: {}", e.0);
-                Task::none()
-            }
-            Message::TaxPaid(Err(e)) => {
+                if Self::is_game_over_error(&e) {
+                    return self.force_exit_to_menu("Игра уже завершена");
+                }
                 self.status = format!("Ошибка налога: {}", e.0);
                 Task::none()
             }
@@ -1985,7 +2034,41 @@ impl DreamBreaker {
                 )
             }
             Message::BoardReloaded(Err(_)) => Task::none(),
+            Message::StaleGamesReset => Task::none(),
         }
+    }
+
+    fn is_game_over_error(e: &db::DbError) -> bool {
+        e.0.contains("GAME_OVER")
+    }
+
+    fn force_exit_to_menu(&mut self, reason: &str) -> Task<Message> {
+        self.status = reason.to_string();
+        self.screen = Screen::Menu;
+        self.active_game_id = None;
+        self.player_state = None;
+        self.game_rules = None;
+        self.board_cells.clear();
+        self.inventory.clear();
+        self.player_properties.clear();
+        self.dice_roll = None;
+        self.turn_phase = TurnPhase::WaitingRoll;
+        self.cell_action = None;
+        self.shop_slots.clear();
+        self.tooltip_item = None;
+        self.tooltip_visible = false;
+        self.tooltip_locked = false;
+        self.bot_participants.clear();
+        self.bot_turn_queue.clear();
+        self.bot_turn_names.clear();
+        self.bot_turn_log.clear();
+        self.income_log.clear();
+        self.start_log.clear();
+        self.rent_received_log.clear();
+        self.show_property_mgmt = false;
+        self.selected_property = None;
+        self.game_menu_open = false;
+        Task::none()
     }
 
     fn clear_form(&mut self) {
@@ -3128,52 +3211,50 @@ impl DreamBreaker {
                 .into()
         };
 
-        // Блок СТАРТ — центр поля
-        let start_overlay: Element<'_, Message> = if self.start_log.is_empty() {
-            Space::new(Length::Shrink, Length::Shrink).into()
-        } else {
-            let mut col = column![]
-                .spacing(self.s(3.0) as u16)
-                .align_x(Alignment::Center);
-            for msg in &self.start_log {
-                col = col.push(make_badge(msg, (0.1, 0.35, 0.1), (0.3, 0.8, 0.3)));
-            }
-            container(col)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(iced::alignment::Horizontal::Center)
-                .align_y(iced::alignment::Vertical::Center)
-                .padding(iced::Padding {
-                    top: self.s(120.0),
-                    bottom: 0.0,
-                    left: 0.0,
-                    right: 0.0,
-                })
-                .into()
-        };
+        // Единый блок событий: СТАРТ → списания (налог/аренда) → доходы от аренды.
+        // Все сообщения одного типа объединяются в стопку, типы идут друг за другом —
+        // каждый следующий автоматически смещается ниже предыдущего.
+        let events_overlay: Element<'_, Message> = {
+            let has_any = !self.start_log.is_empty()
+                || !self.income_log.is_empty()
+                || !self.rent_received_log.is_empty();
 
-        // Блок прочих событий — чуть ниже СТАРТ
-        let income_overlay: Element<'_, Message> = if self.income_log.is_empty() {
-            Space::new(Length::Shrink, Length::Shrink).into()
-        } else {
-            let mut col = column![]
-                .spacing(self.s(3.0) as u16)
-                .align_x(Alignment::Center);
-            for msg in &self.income_log {
-                col = col.push(make_badge(msg, (0.25, 0.1, 0.1), (0.8, 0.3, 0.3)));
+            if !has_any {
+                Space::new(Length::Shrink, Length::Shrink).into()
+            } else {
+                let mut col = column![]
+                    .spacing(self.s(5.0) as u16)
+                    .align_x(Alignment::Center)
+                    .max_width(self.s(320.0));
+
+                // 1. СТАРТ (зелёный)
+                for msg in &self.start_log {
+                    col = col.push(make_badge(msg, (0.1, 0.35, 0.1), (0.3, 0.8, 0.3)));
+                }
+
+                // 2. Списания: налог / чужая аренда (красный)
+                for msg in &self.income_log {
+                    col = col.push(make_badge(msg, (0.25, 0.1, 0.1), (0.8, 0.3, 0.3)));
+                }
+
+                // 3. Доходы от аренды ботов (зелёный)
+                for msg in &self.rent_received_log {
+                    col = col.push(make_badge(msg, (0.05, 0.3, 0.05), (0.2, 0.8, 0.2)));
+                }
+
+                container(col)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center)
+                    .align_y(iced::alignment::Vertical::Top)
+                    .padding(iced::Padding {
+                        top: self.s(120.0),
+                        bottom: 0.0,
+                        left: 0.0,
+                        right: 0.0,
+                    })
+                    .into()
             }
-            container(col)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(iced::alignment::Horizontal::Center)
-                .align_y(iced::alignment::Vertical::Center)
-                .padding(iced::Padding {
-                    top: self.s(160.0),
-                    bottom: 0.0,
-                    left: 0.0,
-                    right: 0.0,
-                })
-                .into()
         };
         // Блок действия на клетке
         let action_block: Option<Element<'_, Message>> = match &self.cell_action {
@@ -3306,9 +3387,9 @@ impl DreamBreaker {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .align_x(iced::alignment::Horizontal::Center)
-                .align_y(iced::alignment::Vertical::Center)
+                .align_y(iced::alignment::Vertical::Bottom)
                 .padding(iced::Padding {
-                    bottom: self.s(230.0),
+                    bottom: self.s(180.0),
                     top: 0.0,
                     left: 0.0,
                     right: 0.0,
@@ -3319,7 +3400,7 @@ impl DreamBreaker {
         };
 
         let center_overlay: Element<'_, Message> =
-            stack![dice_overlay, action_overlay, start_overlay, income_overlay]
+            stack![dice_overlay, action_overlay, events_overlay]
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into();

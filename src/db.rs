@@ -180,7 +180,16 @@ pub async fn authenticate_user(
 
     Ok(user)
 }
-
+pub async fn get_user_by_id(pool: &PgPool, user_id: Uuid) -> Result<Option<User>, DbError> {
+    let user = sqlx::query_as::<_, User>(
+        "SELECT id, username, type, password_hash, created_at, is_active
+         FROM get_user_by_id($1)",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(user)
+}
 /// Вызывает функцию БД: list_users().
 pub async fn list_users(pool: &PgPool) -> Result<Vec<(Uuid, String)>, DbError> {
     let users: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, username FROM list_users()")
@@ -764,4 +773,11 @@ pub async fn sell_power_up(
     .fetch_one(pool)
     .await?;
     Ok(state)
+}
+pub async fn reset_stale_active_games(pool: &PgPool, user_id: Uuid) -> Result<(), DbError> {
+    sqlx::query("SELECT reset_stale_active_games($1)")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
