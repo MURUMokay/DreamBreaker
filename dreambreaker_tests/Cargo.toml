@@ -2,6 +2,7 @@
 name = "dreambreaker_tests"
 version = "0.1.0"
 edition = "2021"
+doctest = false
 
 [dependencies]
 sqlx = { version = "0.8", features = [
@@ -12,7 +13,7 @@ sqlx = { version = "0.8", features = [
     "chrono",
     "uuid",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4" }
 dotenvy = "0.15"
