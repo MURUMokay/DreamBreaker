@@ -427,8 +427,10 @@ BEGIN
         RAISE EXCEPTION 'Собственность не найдена на клетке %', p_cell_index;
     END IF;
 
-    SELECT p.rent_cost, p.owner_user_id INTO v_rent, v_owner_id
-    FROM properties p WHERE p.id = v_prop_id;
+    SELECT p.owner_user_id INTO v_owner_id
+FROM properties p WHERE p.id = v_prop_id;
+
+v_rent := calc_rent(p_game_id, v_prop_id);
 
     UPDATE game_participants gp2
     SET balance     = gp2.balance - v_rent,

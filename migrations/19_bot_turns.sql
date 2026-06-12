@@ -131,11 +131,10 @@ BEGIN
         ELSIF v_owner_id != p_bot_id THEN
             -- Чужая — нужно платить аренду
             -- pay_rent использует p.rent_cost (без усилений) — то же поведение, что у игрока
-            SELECT p.rent_cost INTO v_rent
-            FROM properties p WHERE p.id = v_prop_id;
+            v_rent := calc_rent(p_game_id, v_prop_id);
 
-            IF v_balance >= v_rent THEN
-                PERFORM pay_rent(p_game_id, p_bot_id, v_cell_index);
+IF v_balance >= v_rent THEN
+    PERFORM pay_rent(p_game_id, p_bot_id, v_cell_index);
                 v_action := 'rent_paid';
                 v_detail := v_prop_name || ':' || v_rent::TEXT;
             ELSE

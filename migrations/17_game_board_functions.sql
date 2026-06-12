@@ -312,18 +312,18 @@ BEGIN
         RETURN 0;
     END IF;
 
-    -- Суммируем эффекты усилений владельца
+    -- Суммируем эффекты усилений, установленных в данную собственность
     SELECT
-        COALESCE(SUM(CASE WHEN (pu.effect->>'type') = 'flat_base'
-                     THEN (pu.effect->>'value')::BIGINT ELSE 0 END), 0),
-        COALESCE(SUM(CASE WHEN (pu.effect->>'type') = 'percent_bonus'
-                     THEN (pu.effect->>'value')::NUMERIC ELSE 0 END), 0),
-        COALESCE(SUM(CASE WHEN (pu.effect->>'type') = 'flat_final'
-                     THEN (pu.effect->>'value')::BIGINT ELSE 0 END), 0)
+        COALESCE(SUM(CASE WHEN (elem->'effect'->>'type') = 'flat_base'
+                     THEN (elem->'effect'->>'value')::BIGINT ELSE 0 END), 0),
+        COALESCE(SUM(CASE WHEN (elem->'effect'->>'type') = 'percent_bonus'
+                     THEN (elem->'effect'->>'value')::NUMERIC ELSE 0 END), 0),
+        COALESCE(SUM(CASE WHEN (elem->'effect'->>'type') = 'flat_final'
+                     THEN (elem->'effect'->>'value')::BIGINT ELSE 0 END), 0)
     INTO v_flat_base, v_pct_bonus, v_flat_final
-    FROM player_inventory pi
-    JOIN power_ups pu ON pu.id = pi.power_up_id
-    WHERE pi.game_id = p_game_id AND pi.user_id = v_owner_user_id;
+    FROM properties p
+    CROSS JOIN jsonb_array_elements(p.upgrades) AS elem
+    WHERE p.id = p_property_id;
 
     -- Формула: CEIL((base + flat_base) * (0.11 + pct_bonus/100)) + flat_final
     v_result := CEIL((v_base_cost + v_flat_base) * (0.11 + v_pct_bonus / 100.0))
