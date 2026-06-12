@@ -869,14 +869,8 @@ impl DreamBreaker {
             }
             Message::GameResultLoaded(Ok(result)) => {
                 self.game_result = result;
-                if let Some((user_id, _)) = self.current_user.clone() {
-                    if let Some(pool) = self.pool.clone() {
-                        let _ = Task::perform(
-                            async move { db::get_active_game_for_user(&pool, user_id).await },
-                            Message::ActiveGameChecked,
-                        );
-                    }
-                }
+                self.active_game_id = None;
+                self.has_active_game = Some(false);
                 self.screen = Screen::GameOver;
                 Task::none()
             }

@@ -11,7 +11,7 @@ BEGIN
 
     IF NOT EXISTS (
         SELECT 1 FROM games
-        WHERE id = p_game_id AND status IN ('active', 'pending')
+        WHERE id = p_game_id AND status IN ('active', 'pending', 'paused')
     ) THEN
         RAISE EXCEPTION 'GAME_OVER: игра уже завершена или сдана';
     END IF;
