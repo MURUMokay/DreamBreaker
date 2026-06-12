@@ -17,9 +17,6 @@ fn main() -> iced::Result {
         .run_with(DreamBreaker::new)
 }
 
-// ─────────────────────────────────────────────
-// Режим окна
-// ─────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowMode {
     Window,
@@ -44,9 +41,9 @@ const WINDOW_MODES: &[WindowMode] = &[
 ];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnPhase {
-    WaitingRoll,   // ждём броска кубика
-    Rolled,        // кубик брошен, игрок переместился — можно завершить ход
-    WaitingAction, // ждём действия на клетке (купить/пропустить/аренда)
+    WaitingRoll,
+    Rolled,
+    WaitingAction,
 }
 #[derive(Debug, Clone)]
 enum CellAction {
@@ -60,23 +57,21 @@ enum CellAction {
         rent: i64,
         owner: String,
     },
-    Tax, // <- добавить
+    Tax,
     Info(String),
     Shop {
         shop_id: Uuid,
     },
 }
-// ─────────────────────────────────────────────
-// State
-// ─────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 struct TooltipItem {
     name: String,
     description: String,
     effect_type: String,
     effect_value: i64,
-    buy_cost: Option<i64>,  // None если из инвентаря
-    sell_cost: Option<i64>, // None если из магазина (ещё не куплен)
+    buy_cost: Option<i64>,
+    sell_cost: Option<i64>,
 }
 
 struct DreamBreaker {
@@ -96,12 +91,10 @@ struct DreamBreaker {
     has_active_game: Option<bool>,
     user_games: Vec<(Uuid, String, i64, i32, chrono::DateTime<chrono::Utc>)>,
 
-    // Создание игры
     create_game_balance: i64,
     create_game_max_turns: i32,
     create_game_target_balance: i64,
 
-    // Активная игра
     active_game_id: Option<Uuid>,
     game_rules: Option<db::GameRules>,
     player_state: Option<db::ParticipantState>,
@@ -110,48 +103,40 @@ struct DreamBreaker {
     game_menu_open: bool,
     dice_roll: Option<(u8, u8)>,
     local_player_pos: i32,
-    turn_phase: TurnPhase,           // фаза хода
-    cell_action: Option<CellAction>, // текущее действие на клетке
-    shop_slots: Vec<db::ShopSlot>,   // текущие слоты открытого магазина
+    turn_phase: TurnPhase,
+    cell_action: Option<CellAction>,
+    shop_slots: Vec<db::ShopSlot>,
 
-    // Экран завершения
     game_result: Option<db::GameResult>,
     user_stats: Option<db::UserStats>,
     show_stats: bool,
 
-    // Управление собственностью
     show_property_mgmt: bool,
     player_properties: Vec<db::PlayerProperty>,
     selected_property: Option<usize>,
 
-    // Боты
     bot_participants: Vec<db::BotParticipant>,
     bot_turn_queue: Vec<Uuid>,
     bot_turn_names: Vec<String>,
     bot_turn_log: Vec<String>,
 
-    // Тултип усиления
     tooltip_item: Option<TooltipItem>,
     tooltip_hover_start: Option<std::time::Instant>,
     tooltip_visible: bool,
     tooltip_locked: bool,
 
-    // Zoom/pan игрового поля
     board_zoom: f32,
     board_pan_x: f32,
     board_pan_y: f32,
     board_dragging: bool,
     board_mouse_pos: (f32, f32),
 
-    // Лог пополнений баланса игрока
     income_log: Vec<String>,
     start_log: Vec<String>,
     rent_received_log: Vec<String>,
 
-    // Наведение на клетку
     hovered_cell: Option<i32>,
 
-    // Настройки
     window_mode: WindowMode,
 
     settings_from_game: bool,
@@ -229,16 +214,12 @@ enum Screen {
     LoadGame,
     CreateGame,
     Game,
-    GameOver, // экран завершения
+    GameOver,
     Settings,
 }
 
-// ─────────────────────────────────────────────
-// Messages
-// ─────────────────────────────────────────────
 #[derive(Debug, Clone)]
 enum Message {
-    // Навигация
     OpenLogin,
     StaleGamesReset,
     OpenRegister,
@@ -248,22 +229,19 @@ enum Message {
     BackToMenu,
     Logout,
     Exit,
-    // Профиль
+
     ToggleProfileMenu,
     SelectUser(Uuid, String),
     OpenStats,
-    ToggleStats, // открыть/закрыть оверлей статистики
+    ToggleStats,
 
-    // Ввод
     UsernameChanged(String),
     PasswordChanged(String),
     Password2Changed(String),
 
-    // Формы
     SubmitLogin,
     SubmitRegister,
 
-    // Создание игры
     GameBalanceIncrease,
     GameBalanceDecrease,
     GameMaxTurnsIncrease,
@@ -272,7 +250,6 @@ enum Message {
     GameTargetBalanceDecrease,
     CreateGameSubmit,
 
-    // Игровое меню
     ToggleGameMenu,
     SaveAndExit,
     Surrender,
@@ -280,7 +257,7 @@ enum Message {
     RollDice,
     EndTurn,
     TurnSaved(Result<db::ParticipantState, db::DbError>),
-    ContinueGame, // загрузить последнюю игру напрямую
+    ContinueGame,
     BalancesLoaded(Result<Vec<(Uuid, i64, String)>, db::DbError>),
     BuyProperty,
     SkipAction,
@@ -299,7 +276,6 @@ enum Message {
     SellPowerUp(Uuid),
     PowerUpSold(Result<db::ParticipantState, db::DbError>),
 
-    // Управление собственностью
     TogglePropertyMgmt,
     SelectProperty(usize),
     PropertiesLoaded(Result<Vec<db::PlayerProperty>, db::DbError>),
@@ -314,29 +290,26 @@ enum Message {
     UpgradeInstalled(Result<String, db::DbError>),
     UpgradeUninstalled(Result<String, db::DbError>),
 
-    // Боты
     BotsLoaded(Result<Vec<db::BotParticipant>, db::DbError>),
-    BotsRefreshed(Result<Vec<db::BotParticipant>, db::DbError>), // только обновить позиции, без запуска ходов
+    BotsRefreshed(Result<Vec<db::BotParticipant>, db::DbError>),
     PlayerStateRefreshed(Result<Option<db::ParticipantState>, db::DbError>),
     BotTurnDone(Result<db::BotTurnResult, db::DbError>),
     TooltipHoverStart(TooltipItem),
     TooltipHoverEnd,
     TooltipTick,
-    // Zoom/pan поля
+
     BoardZoom(f32),
     BoardScrollTo(iced::widget::scrollable::AbsoluteOffset),
     BoardScrolled(iced::widget::scrollable::Viewport),
     BoardDragStart,
     BoardDragEnd,
     BoardMouseMove(f32, f32),
-    // Наведение на клетку доски
+
     CellHovered(Option<i32>),
 
-    // Настройки
     SetWindowMode(WindowMode),
     WindowResized(f32, f32),
 
-    // БД
     DbConnected(Result<PgPool, db::DbError>),
     MigrationsApplied(Result<(), db::DbError>),
     UsersLoaded(Result<Vec<(Uuid, String)>, db::DbError>),
@@ -367,9 +340,6 @@ enum Message {
     GameResultLoaded(Result<Option<db::GameResult>, db::DbError>),
 }
 
-// ─────────────────────────────────────────────
-// Update
-// ─────────────────────────────────────────────
 impl DreamBreaker {
     fn new() -> (Self, Task<Message>) {
         let database_url = match std::env::var("DATABASE_URL") {
@@ -408,7 +378,6 @@ impl DreamBreaker {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            // ── Навигация ──────────────────────────────────
             Message::OpenLogin => {
                 self.screen = Screen::Login;
                 self.profile_menu_open = false;
@@ -491,7 +460,6 @@ impl DreamBreaker {
             }
             Message::Exit => std::process::exit(0),
 
-            // ── Профиль ────────────────────────────────────
             Message::ToggleProfileMenu => {
                 self.profile_menu_open = !self.profile_menu_open;
                 Task::none()
@@ -524,7 +492,6 @@ impl DreamBreaker {
                 }
             }
 
-            // ── Ввод ──────────────────────────────────────
             Message::UsernameChanged(v) => {
                 self.input_username = v;
                 Task::none()
@@ -538,7 +505,6 @@ impl DreamBreaker {
                 Task::none()
             }
 
-            // ── Вход ───────────────────────────────────────
             Message::SubmitLogin => {
                 let username = self.input_username.trim().to_string();
                 let password = self.input_password.clone();
@@ -594,7 +560,6 @@ impl DreamBreaker {
                 Task::none()
             }
 
-            // ── Регистрация ────────────────────────────────
             Message::SubmitRegister => {
                 let username = self.input_username.trim().to_string();
                 let password = self.input_password.clone();
@@ -656,7 +621,6 @@ impl DreamBreaker {
                 Task::none()
             }
 
-            // ── Параметры создания игры ────────────────────
             Message::GameBalanceIncrease => {
                 self.create_game_balance += 100;
                 if self.create_game_target_balance <= self.create_game_balance {
@@ -737,7 +701,6 @@ impl DreamBreaker {
                 Task::none()
             }
 
-            // ── Продолжить последнюю игру ──────────────────
             Message::ContinueGame => {
                 let (user_id, _) = match &self.current_user {
                     Some(u) => u.clone(),
@@ -761,7 +724,6 @@ impl DreamBreaker {
                 }
             }
 
-            // ── Загрузка игры  ──────────────────────────────
             Message::LoadGame(game_id) => {
                 let (user_id, _) = match &self.current_user {
                     Some(u) => u.clone(),
@@ -809,7 +771,6 @@ impl DreamBreaker {
                 Task::none()
             }
 
-            // ── Игровое меню ───────────────────────────────
             Message::ToggleGameMenu => {
                 self.game_menu_open = !self.game_menu_open;
                 Task::none()
@@ -844,7 +805,7 @@ impl DreamBreaker {
                 self.screen = Screen::Menu;
                 self.has_active_game = Some(true);
                 self.status = "Игра сохранена".to_string();
-                // Сбрасываем игровой стейт чтобы он не "протекал" в следующую сессию
+
                 self.local_player_pos = 0;
                 self.player_state = None;
                 self.game_rules = None;
@@ -968,7 +929,6 @@ impl DreamBreaker {
                 Task::none()
             }
 
-            // ── Настройки ──────────────────────────────────
             Message::SetWindowMode(mode) => {
                 self.window_mode = mode;
                 let wmode = match mode {
@@ -985,7 +945,6 @@ impl DreamBreaker {
                 })
             }
 
-            // ── БД ───────────────────────────────────────
             Message::DbConnected(Ok(pool)) => {
                 self.status = "Применяю миграции...".to_string();
                 let pool_clone = pool.clone();
@@ -1082,7 +1041,6 @@ impl DreamBreaker {
                 self.turn_phase = TurnPhase::Rolled;
                 self.shop_slots = Vec::new();
 
-                // Определяем действие на новой клетке
                 let new_pos = self.local_player_pos;
                 let user_id = self.current_user.as_ref().map(|(id, _)| *id);
                 let cell = self
@@ -1123,7 +1081,6 @@ impl DreamBreaker {
                     _ => None,
                 };
 
-                // Если магазин — сразу загружаем слоты
                 if let Some(CellAction::Shop { shop_id }) = &self.cell_action {
                     let shop_id = *shop_id;
                     let game_id = match self.active_game_id {
@@ -1283,13 +1240,12 @@ impl DreamBreaker {
                 Task::none()
             }
 
-            // ── Управление собственностью ───────────────────────
             Message::TogglePropertyMgmt => {
                 self.show_property_mgmt = !self.show_property_mgmt;
                 if !self.show_property_mgmt {
                     return Task::none();
                 }
-                // При открытии — загружаем свежий список собственностей
+
                 let game_id = match self.active_game_id {
                     Some(id) => id,
                     None => return Task::none(),
@@ -1355,7 +1311,7 @@ impl DreamBreaker {
                 } else {
                     self.status = format!("Нельзя установить: {}", result);
                 }
-                // Перезагружаем собственности и инвентарь
+
                 let game_id = match self.active_game_id {
                     Some(id) => id,
                     None => return Task::none(),
@@ -1516,7 +1472,6 @@ impl DreamBreaker {
                     None => return Task::none(),
                 };
 
-                // Оплата аренды
                 if let Some(CellAction::MustPayRent { cell_index, .. }) = &self.cell_action.clone()
                 {
                     let ci = *cell_index;
@@ -1527,7 +1482,6 @@ impl DreamBreaker {
                     );
                 }
 
-                // Оплата налога
                 if let Some(CellAction::Tax) = &self.cell_action {
                     self.cell_action = None;
                     return Task::perform(
@@ -1561,9 +1515,7 @@ impl DreamBreaker {
                 self.bot_turn_log.clear();
                 self.start_log.clear();
                 self.rent_received_log.clear();
-                // income_log не чистим — там уже лежит аренда/налог этого хода
-                // Бонус СТАРТ фиксированный: 400 за приземление, 200 за прохождение.
-                // balance_diff ненадёжен если до этого была аренда/налог — проверяем позицию.
+
                 let start_bonus = if new_state.position == 0 && old_balance > 0 {
                     400i64
                 } else if old_balance > 0 && new_state.position < self.local_player_pos {
@@ -1584,7 +1536,6 @@ impl DreamBreaker {
                     None => return Task::none(),
                 };
 
-                // Загружаем список живых ботов и запускаем их ходы
                 if let Some(pool) = self.pool.clone() {
                     return Task::perform(
                         async move { db::get_bot_participants(&pool, game_id).await },
@@ -1594,10 +1545,9 @@ impl DreamBreaker {
                 Task::none()
             }
 
-            // ── Ходы ботов ─────────────────────────────────
             Message::BotsLoaded(Ok(bots)) => {
                 self.bot_participants = bots.clone();
-                // Заполняем очереди: только живые боты по turn_order
+
                 self.bot_turn_queue = bots.iter().map(|b| b.user_id).collect();
                 self.bot_turn_names = bots.iter().map(|b| b.username.clone()).collect();
 
@@ -1610,7 +1560,6 @@ impl DreamBreaker {
                     None => return Task::none(),
                 };
 
-                // Запускаем ход первого бота из очереди
                 if !self.bot_turn_queue.is_empty() {
                     let bot_id = self.bot_turn_queue.remove(0);
                     let _bot_name = if !self.bot_turn_names.is_empty() {
@@ -1626,9 +1575,9 @@ impl DreamBreaker {
                     let d1 = ((seed % 6) + 1) as i32;
                     let d2 = (((seed / 7) % 6) + 1) as i32;
                     let dice = d1 + d2;
-                    // Сохраняем имя текущего бота для лога
+
                     self.status = format!("Ходит {}... (кубик: {}+{}={})", _bot_name, d1, d2, dice);
-                    // Временно сохраняем имя в очередь имён для BotTurnDone (как первый элемент)
+
                     self.bot_turn_names.insert(0, _bot_name);
                     return Task::perform(
                         async move { db::do_bot_turn(&pool, game_id, bot_id, dice).await },
@@ -1636,7 +1585,6 @@ impl DreamBreaker {
                     );
                 }
 
-                // Ботов нет — сразу проверяем балансы
                 let pool2 = pool.clone();
                 Task::batch([
                     Task::perform(
@@ -1651,7 +1599,7 @@ impl DreamBreaker {
             }
             Message::BotsLoaded(Err(e)) => {
                 self.status = format!("Ошибка загрузки ботов: {}", e.0);
-                // Всё равно проверяем балансы
+
                 let game_id = match self.active_game_id {
                     Some(id) => id,
                     None => return Task::none(),
@@ -1676,7 +1624,6 @@ impl DreamBreaker {
             Message::PlayerStateRefreshed(Ok(None)) => Task::none(),
             Message::PlayerStateRefreshed(Err(_)) => Task::none(),
             Message::BotTurnDone(Ok(result)) => {
-                // Извлекаем имя текущего бота из головы очереди имён
                 let bot_name = if !self.bot_turn_names.is_empty() {
                     self.bot_turn_names.remove(0)
                 } else {
@@ -1689,7 +1636,7 @@ impl DreamBreaker {
                         let parts: Vec<&str> = result.action_detail.splitn(2, ':').collect();
                         let cell_name = parts.first().copied().unwrap_or("?");
                         let amount = parts.get(1).copied().unwrap_or("?");
-                        // Если владелец клетки — игрок, фиксируем доход
+
                         if let Some((user_id, _)) = &self.current_user {
                             let is_player_owner = self.board_cells.iter().any(|c| {
                                 c.prop_name.as_deref() == Some(cell_name)
@@ -1723,7 +1670,6 @@ impl DreamBreaker {
                     None => return Task::none(),
                 };
 
-                // Следующий бот в очереди?
                 if !self.bot_turn_queue.is_empty() {
                     let bot_id = self.bot_turn_queue.remove(0);
                     let next_name = if !self.bot_turn_names.is_empty() {
@@ -1747,7 +1693,6 @@ impl DreamBreaker {
                     );
                 }
 
-                // Все боты походили — обновляем поле, позиции ботов и проверяем балансы
                 self.status = "Ходы ботов завершены".to_string();
                 let pool3 = pool.clone();
                 let pool4 = pool.clone();
@@ -1782,7 +1727,7 @@ impl DreamBreaker {
             }
             Message::BotTurnDone(Err(e)) => {
                 self.status = format!("Ошибка хода бота: {}", e.0);
-                // Пропускаем имя текущего бота
+
                 if !self.bot_turn_names.is_empty() {
                     self.bot_turn_names.remove(0);
                 }
@@ -1844,7 +1789,6 @@ impl DreamBreaker {
 
                 let moves_left = (rules.max_turns - state.moves_made).max(0);
 
-                // Считаем не-банкротов среди ботов
                 let bots_alive = balances
                     .iter()
                     .filter(|(id, balance, utype)| *id != user_id && utype == "bot" && *balance > 0)
@@ -1852,13 +1796,9 @@ impl DreamBreaker {
 
                 let player_bankrupt = state.balance <= 0;
 
-                // Победа 1: баланс достиг цели
-                // Победа 2: все боты банкроты, игрок жив
                 let victory =
                     state.balance >= rules.target_balance || (!player_bankrupt && bots_alive == 0);
 
-                // Поражение 1: ходы кончились, цель не достигнута
-                // Поражение 2: игрок банкрот
                 let defeat = (!victory && moves_left <= 0) || player_bankrupt;
 
                 if victory || defeat {
@@ -1910,8 +1850,6 @@ impl DreamBreaker {
                 )
             }
             Message::SkipAction => {
-                // Если это аренда которую нельзя пропустить — всё равно платим при EndTurn
-                // Если можно пропустить (не купить) — просто сбрасываем
                 self.cell_action = None;
                 self.shop_slots.clear();
                 self.tooltip_item = None;
@@ -1922,7 +1860,7 @@ impl DreamBreaker {
             Message::PropertyBought(Ok(new_state)) => {
                 self.player_state = Some(new_state);
                 self.status = "Собственность куплена".to_string();
-                // Перезагружаем клетки чтобы обновить владельца
+
                 let game_id = match self.active_game_id {
                     Some(id) => id,
                     None => return Task::none(),
@@ -1953,7 +1891,7 @@ impl DreamBreaker {
                 self.player_state = Some(new_state);
                 self.status = "Аренда уплачена, завершаю ход...".to_string();
                 self.cell_action = None;
-                // Сразу фиксируем ход — не требуем повторного нажатия
+
                 let game_id = match self.active_game_id {
                     Some(id) => id,
                     None => return Task::none(),
@@ -1989,7 +1927,7 @@ impl DreamBreaker {
                 self.player_state = Some(new_state);
                 self.status = "Налог уплачен, завершаю ход...".to_string();
                 self.cell_action = None;
-                // Сразу фиксируем ход — не требуем повторного нажатия
+
                 let game_id = match self.active_game_id {
                     Some(id) => id,
                     None => return Task::none(),
@@ -2017,7 +1955,7 @@ impl DreamBreaker {
             }
             Message::BoardReloaded(Ok(cells)) => {
                 self.board_cells = cells;
-                // Перезагружаем собственности, чтобы SVG-уровень отражал актуальные усиления
+
                 let game_id = match self.active_game_id {
                     Some(id) => id,
                     None => return Task::none(),
@@ -2081,9 +2019,6 @@ impl DreamBreaker {
     }
 }
 
-// ─────────────────────────────────────────────
-// View
-// ─────────────────────────────────────────────
 impl DreamBreaker {
     fn scale(&self) -> f32 {
         let sx = self.window_width / 1024.0;
@@ -2196,7 +2131,6 @@ impl DreamBreaker {
             .on_press(Message::ToggleProfileMenu)
             .padding(self.s(8.0) as u16);
 
-        // Кнопка «Статистика» — всегда справа от профиля, активна только для залогиненных
         let stats_btn: Element<'_, Message> = if self.current_user.is_some() {
             button(text("Статистика").size(self.ts(16)))
                 .on_press(Message::OpenStats)
@@ -2221,7 +2155,6 @@ impl DreamBreaker {
             .padding(self.s(4.0) as u16);
 
         if self.current_user.is_some() {
-            // Залогинен: показываем других пользователей и кнопку «Выйти»
             for (id, name) in &self.users {
                 if self.current_user.as_ref().map(|(uid, _)| uid) != Some(id) {
                     menu = menu.push(profile_dropdown_btn(
@@ -2233,7 +2166,6 @@ impl DreamBreaker {
             }
             menu = menu.push(profile_dropdown_btn("Выйти", Message::Logout, sc));
         } else {
-            // Не залогинен: показываем доступные аккаунты (если есть)
             for (id, name) in &self.users {
                 menu = menu.push(profile_dropdown_btn(
                     name,
@@ -2248,11 +2180,9 @@ impl DreamBreaker {
             ));
         }
 
-        // Высота одной кнопки ~(15*sc + 8*sc*2 + spacing) ≈ 47px при sc=1
-        // Показываем максимум 5 пунктов без прокрутки
-        let btn_h = self.s(15.0) + self.s(8.0) * 2.0 + self.s(4.0); // текст + padding + spacing
+        let btn_h = self.s(15.0) + self.s(8.0) * 2.0 + self.s(4.0);
         let visible_items = 5usize;
-        let total_items = self.users.len() + 1; // +1 за «Выйти» / «Создать»
+        let total_items = self.users.len() + 1;
         let max_h = btn_h * visible_items as f32 + self.s(8.0);
         let needs_scroll = total_items > visible_items;
 
@@ -2426,7 +2356,6 @@ impl DreamBreaker {
         let reroll_cost = 50 + 15 * reroll_count as i64;
         let sc = self.scale();
 
-        // Сетка слотов 2×2
         let mut slots_grid = column![].spacing(self.s(8.0) as u16);
         let visible: Vec<&db::ShopSlot> = self
             .shop_slots
@@ -2559,8 +2488,8 @@ impl DreamBreaker {
                 ..Default::default()
             });
 
-        let left_w = self.s(310.0) + self.s(16.0); // ширина левой панели с padding
-        let right_w = self.s(200.0) + self.s(16.0); // ширина правой панели с padding
+        let left_w = self.s(310.0) + self.s(16.0);
+        let right_w = self.s(200.0) + self.s(16.0);
 
         container(
             container(card)
@@ -2627,7 +2556,6 @@ impl DreamBreaker {
                 ..Default::default()
             });
 
-        // Позиционируем по центру экрана, чуть выше середины
         mouse_area(
             container(
                 container(card)
@@ -2761,18 +2689,15 @@ impl DreamBreaker {
     fn view_load_game(&self) -> Element<'_, Message> {
         let sc = self.scale();
 
-        // Фиксированные высоты элементов вне списка:
-        // заголовок + шапка таблицы + кнопка Назад + отступы ≈ s(180)
-        // Резерв: заголовок + шапка таблицы + кнопка Назад + отступы + статусбар
-        let chrome_h = self.s(40.0)   // хедер (резервируется снаружи)
-    + self.s(40.0)             // заголовок "Загрузить игру"
-    + self.s(20.0)             // шапка таблицы
-    + self.s(12.0)             // Space перед шапкой
-    + self.s(4.0)              // Space после шапки
-    + self.s(44.0)             // кнопка Назад (padding*2 + текст)
-    + self.s(12.0)             // Space перед кнопкой
-    + self.s(28.0)             // статусная строка снизу
-    + self.s(24.0); // запас
+        let chrome_h = self.s(40.0)
+            + self.s(40.0)
+            + self.s(20.0)
+            + self.s(12.0)
+            + self.s(4.0)
+            + self.s(44.0)
+            + self.s(12.0)
+            + self.s(28.0)
+            + self.s(24.0);
         let list_max_h = (self.window_height - chrome_h).max(self.s(60.0));
 
         let list_area: Element<'_, Message> = if self.user_games.is_empty() {
@@ -3133,7 +3058,6 @@ impl DreamBreaker {
             ..Default::default()
         });
 
-        // SVG-спрайты кубиков
         let dice_svg_row: Element<'_, Message> = {
             let sz = self.s(36.0);
             let inner: Element<'_, Message> = match self.dice_roll {
@@ -3165,7 +3089,6 @@ impl DreamBreaker {
                 .into()
         };
 
-        // Одна кнопка: "Бросить кубик" / "Завершить ход"
         let action_btn: Element<'_, Message> = match self.turn_phase {
             TurnPhase::WaitingRoll => button(text("Бросить кубик").size(self.ts(15)))
                 .on_press(Message::RollDice)
@@ -3188,8 +3111,6 @@ impl DreamBreaker {
             .align_x(Alignment::Center)
             .into();
 
-        // Лог дохода — отдельный оверлей, прибитый к низу центра, не сдвигает кнопку
-        // Вспомогательное замыкание для одного badge-сообщения
         let make_badge = |msg: &str,
                           bg: (f32, f32, f32),
                           border: (f32, f32, f32)|
@@ -3213,9 +3134,6 @@ impl DreamBreaker {
                 .into()
         };
 
-        // Единый блок событий: СТАРТ → списания (налог/аренда) → доходы от аренды.
-        // Все сообщения одного типа объединяются в стопку, типы идут друг за другом —
-        // каждый следующий автоматически смещается ниже предыдущего.
         let events_overlay: Element<'_, Message> = {
             let has_any = !self.start_log.is_empty()
                 || !self.income_log.is_empty()
@@ -3229,17 +3147,14 @@ impl DreamBreaker {
                     .align_x(Alignment::Center)
                     .max_width(self.s(320.0));
 
-                // 1. СТАРТ (зелёный)
                 for msg in &self.start_log {
                     col = col.push(make_badge(msg, (0.1, 0.35, 0.1), (0.3, 0.8, 0.3)));
                 }
 
-                // 2. Списания: налог / чужая аренда (красный)
                 for msg in &self.income_log {
                     col = col.push(make_badge(msg, (0.25, 0.1, 0.1), (0.8, 0.3, 0.3)));
                 }
 
-                // 3. Доходы от аренды ботов (зелёный)
                 for msg in &self.rent_received_log {
                     col = col.push(make_badge(msg, (0.05, 0.3, 0.05), (0.2, 0.8, 0.2)));
                 }
@@ -3258,7 +3173,7 @@ impl DreamBreaker {
                     .into()
             }
         };
-        // Блок действия на клетке
+
         let action_block: Option<Element<'_, Message>> = match &self.cell_action {
             Some(CellAction::CanBuy { cost, name, .. }) => Some(
                 container(
@@ -3354,7 +3269,6 @@ impl DreamBreaker {
             None => None,
         };
 
-        // ── Левая панель: статистика + инвентарь + управление объектами ──
         let mut left_col = column![stats_panel,]
             .spacing(self.s(6.0) as u16)
             .width(Length::Fixed(self.s(310.0)));
@@ -3372,10 +3286,8 @@ impl DreamBreaker {
             })
             .into();
 
-        // ── Центр: игровое поле + оверлей кубика ─────────────────────────
         let board = self.view_board(self.local_player_pos);
 
-        // Кнопка — всегда строго по центру
         let dice_overlay: Element<'_, Message> = container(dice_block)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -3383,7 +3295,6 @@ impl DreamBreaker {
             .align_y(iced::alignment::Vertical::Center)
             .into();
 
-        // action_block — отдельный слой выше кубиков, не смещает кнопку
         let action_overlay: Element<'_, Message> = if let Some(action) = action_block {
             container(action)
                 .width(Length::Fill)
@@ -3412,12 +3323,10 @@ impl DreamBreaker {
             .height(Length::Fill)
             .into();
 
-        // ── Правая панель: статус ботов + лог ────────────────────────────
         let mut right_col = column![]
             .spacing(self.s(8.0) as u16)
             .align_x(Alignment::Center);
 
-        // Панель статусов ботов
         if !self.bot_participants.is_empty() {
             let mut bots_col = column![
                 text("Боты:").size(self.ts(11)),
@@ -3432,7 +3341,7 @@ impl DreamBreaker {
                     2 => Color::from_rgb(0.3, 0.7, 1.0),
                     _ => Color::from_rgb(1.0, 0.85, 0.1),
                 };
-                // Количество собственностей бота из board_cells
+
                 let bot_props = self
                     .board_cells
                     .iter()
@@ -3443,7 +3352,6 @@ impl DreamBreaker {
                 let money_icon_sz = self.s(10.0);
                 let bot_row: Element<'_, Message> = container(
                     row![
-                        // Цветной квадрат — цвет бота
                         container(Space::new(
                             Length::Fixed(self.s(6.0)),
                             Length::Fixed(self.s(6.0)),
@@ -3492,7 +3400,6 @@ impl DreamBreaker {
             );
         }
 
-        // Лог ходов ботов
         if !self.bot_turn_log.is_empty() {
             let mut log_col = column![text("Ходы ботов:").size(self.ts(11))].spacing(2);
             for line in self.bot_turn_log.iter().rev().take(6) {
@@ -3514,10 +3421,8 @@ impl DreamBreaker {
             );
         }
 
-        // ── Правая нижняя: карточка собственности + тултип усиления ──────
         let mut info_col = column![].spacing(self.s(6.0) as u16);
 
-        // Карточка усиления при наведении
         if self.tooltip_visible {
             if let Some(item) = &self.tooltip_item {
                 let mut tip_col = column![
@@ -3563,7 +3468,6 @@ impl DreamBreaker {
             }
         }
 
-        // Карточка собственности при наведении
         if let Some(idx) = self.hovered_cell {
             if let Some(cell) = self.board_cells.iter().find(|c| c.cell_index == idx) {
                 let upg = self
@@ -3618,11 +3522,9 @@ impl DreamBreaker {
 
         let right_panel: Element<'_, Message> = container(
             column![
-                // Верхняя половина — боты и лог
                 container(right_col)
                     .width(Length::Fill)
                     .height(Length::FillPortion(1)),
-                // Нижняя половина — карточки
                 container(info_col)
                     .width(Length::Fill)
                     .height(Length::FillPortion(1))
@@ -3640,7 +3542,6 @@ impl DreamBreaker {
         })
         .into();
 
-        // ── Финальная сборка ─────────────────────────────────────────────
         row![left_panel, board_with_overlay, right_panel]
             .width(Length::Fill)
             .height(Length::Fill)
@@ -3685,11 +3586,8 @@ impl DreamBreaker {
         let fs = (cell_size / 54.0 * 10.0).max(7.0);
         let fs_sm = (cell_size / 54.0 * 9.0).max(6.0);
 
-        // Размер иконки: 4 штуки должны поместиться в ширину клетки
         let icon_sz = (cell_size / 4.0 - 1.0).max(6.0);
 
-        // ── Цвет каждого участника ────────────────────────────────
-        // Игрок — белый; боты — яркие цвета по порядку turn_order
         let player_id: Option<Uuid> = self.current_user.as_ref().map(|(id, _)| *id);
         let bot_colors: Vec<(Uuid, Color)> = self
             .bot_participants
@@ -3697,16 +3595,15 @@ impl DreamBreaker {
             .enumerate()
             .map(|(i, b)| {
                 let c = match i % 4 {
-                    0 => Color::from_rgb(1.0, 0.3, 0.3),  // красный
-                    1 => Color::from_rgb(0.3, 1.0, 0.4),  // зелёный
-                    2 => Color::from_rgb(0.3, 0.7, 1.0),  // голубой
-                    _ => Color::from_rgb(1.0, 0.85, 0.1), // жёлтый
+                    0 => Color::from_rgb(1.0, 0.3, 0.3),
+                    1 => Color::from_rgb(0.3, 1.0, 0.4),
+                    2 => Color::from_rgb(0.3, 0.7, 1.0),
+                    _ => Color::from_rgb(1.0, 0.85, 0.1),
                 };
                 (b.user_id, c)
             })
             .collect();
 
-        // Вспомогательная: цвет иконки по user_id
         let participant_color = |uid: Uuid| -> Color {
             if Some(uid) == player_id {
                 Color::WHITE
@@ -3719,10 +3616,6 @@ impl DreamBreaker {
             }
         };
 
-        // Позиции всех участников на клетках
-        // Игрок: player_pos (локальный, до commit)
-        // Боты: из bot_participants
-        // Структура: cell_index -> Vec<(user_id, color)>
         let mut occupants: std::collections::HashMap<i32, Vec<(Uuid, Color)>> =
             std::collections::HashMap::new();
 
@@ -3740,8 +3633,6 @@ impl DreamBreaker {
                 .push((bot.user_id, c));
         }
 
-        // cell_index → upgrades_count для собственностей игрока
-        // Используется для выбора SVG property_0..3 без обращения к БД
         let prop_upgrades_map: std::collections::HashMap<i32, usize> = self
             .player_properties
             .iter()
@@ -3754,18 +3645,15 @@ impl DreamBreaker {
             for col_i in 0..GRID {
                 let cell_elem: Element<'_, Message> = match grid[row_i][col_i] {
                     None => {
-                        // Пустая внутренняя клетка: рисуем здесь иконки игроков,
-                        // стоящих на соседних клетках периметра (вынос наружу)
                         let mut ext_colors: Vec<Color> = vec![];
-                        // Запоминаем направление первого найденного соседа с периметра:
-                        // (dr, dc) — смещение от пустой клетки к соседу периметра
+
                         let neighbors: [(i32, i32); 4] = [
                             (row_i as i32 - 1, col_i as i32),
                             (row_i as i32 + 1, col_i as i32),
                             (row_i as i32, col_i as i32 - 1),
                             (row_i as i32, col_i as i32 + 1),
                         ];
-                        // dr/dc: направление от пустой клетки К клетке периметра
+
                         let mut border_dir: (i32, i32) = (0, 0);
                         for (r, c) in neighbors {
                             if r >= 0 && r < GRID as i32 && c >= 0 && c < GRID as i32 {
@@ -3798,11 +3686,9 @@ impl DreamBreaker {
                                         .into();
                                 icons_row = icons_row.push(ico);
                             }
-                            // Прижимаем иконки к стороне, обращённой к клетке периметра,
-                            // с отступом ICON_PAD пикселей — иконки будут у самого края,
-                            // визуально "снаружи" клетки периметра.
+
                             const ICON_PAD: f32 = 10.0;
-                            // Прижимаем к стороне, ПРОТИВОПОЛОЖНОЙ периметру — иконки снаружи поля
+
                             let align_x = match border_dir.1 {
                                 d if d > 0 => iced::alignment::Horizontal::Right,
                                 d if d < 0 => iced::alignment::Horizontal::Left,
@@ -3831,7 +3717,6 @@ impl DreamBreaker {
                     Some(idx) => {
                         let side = side_of(idx);
 
-                        // ── Текстовые метки ──────────────────────────────
                         let (label, sublabel) = if idx == 0 {
                             ("СТАРТ".to_string(), String::new())
                         } else {
@@ -3859,7 +3744,6 @@ impl DreamBreaker {
                             }
                         };
 
-                        // ── Цветная полоска группы собственности ─────────
                         let color_stripe: Option<Color> =
                             if cell_map.get(&idx).map(|c| c.cell_type.as_str()) == Some("property")
                             {
@@ -3886,18 +3770,6 @@ impl DreamBreaker {
 
                         let stripe_size = (cell_size * 0.22).max(4.0);
 
-                        // ── Сборка содержимого клетки ─────────────────────
-                        // Структура зависит от стороны:
-                        //   bottom/top: вертикальный layout (column)
-                        //     bottom: [stripe_top] | [text] [owner_bar] [icons_bottom]
-                        //     top:    [icons_top] [owner_bar] [text] | [stripe_bottom]
-                        //   left/right: горизонтальный layout (row)
-                        //     right: [stripe_left] | [icons_right] [owner_bar] [text]
-                        //     left:  [text] [owner_bar] [icons_left] | [stripe_right]
-
-                        // ── Текстовые метки / SVG ──────────────────────────
-                        // property-клетки: SVG property_N с названием и ценой
-                        // ostальные: текст как прежде
                         let text_core: Element<'_, Message> = {
                             let is_prop = cell_map
                                 .get(&idx)
@@ -3906,8 +3778,6 @@ impl DreamBreaker {
 
                             if is_prop {
                                 if let Some(cell) = cell_map.get(&idx) {
-                                    // Уровень усилений: 0 если клетка не принадлежит игроку
-                                    // (боты/свободные), иначе — из player_properties
                                     let upg = prop_upgrades_map.get(&idx).copied().unwrap_or(0);
                                     let prop_svg_size = cell_size;
 
@@ -3970,13 +3840,11 @@ impl DreamBreaker {
                             }
                         };
 
-                        // SVG занимает всю клетку
                         let inner_el: Element<'_, Message> = container(text_core)
                             .width(Length::Fixed(cell_size))
                             .height(Length::Fixed(cell_size))
                             .into();
 
-                        // Фон клетки (выделение если игрок стоит здесь)
                         let is_player = player_pos == idx;
                         let bg = if is_player {
                             Some(Background::Color(Color::from_rgba(0.8, 0.7, 0.0, 0.35)))
@@ -3984,7 +3852,6 @@ impl DreamBreaker {
                             None
                         };
 
-                        // SVG — базовый слой на всю клетку
                         let base_cell: Element<'_, Message> = container(inner_el)
                             .width(Length::Fixed(cell_size))
                             .height(Length::Fixed(cell_size))
@@ -4001,12 +3868,9 @@ impl DreamBreaker {
 
                         let cell_body: Element<'_, Message> = if color_stripe.is_some() || has_owner
                         {
-                            // Слой с двумя полосками: снаружи — цвет группы, изнутри — цвет владельца.
-                            // Реализуем как column/row из двух тонких container'ов внутри stack.
                             let overlay: Element<'_, Message> = {
                                 let bar_thick = (cell_size * 0.18).max(5.0);
 
-                                // Полоска группы (внешняя сторона клетки)
                                 let group_bar: Element<'_, Message> = if let Some(gc) = color_stripe
                                 {
                                     container(Space::new(Length::Fill, Length::Fill))
@@ -4037,7 +3901,6 @@ impl DreamBreaker {
                                     .into()
                                 };
 
-                                // Полоска владельца (внутренняя сторона клетки)
                                 let owner_strip: Element<'_, Message> = if let Some(oc) =
                                     cell_map.get(&idx).and_then(|c| {
                                         if c.cell_type == "property" {
@@ -4075,8 +3938,6 @@ impl DreamBreaker {
                                     .into()
                                 };
 
-                                // Собираем: снаружи group_bar, изнутри owner_strip,
-                                // между ними пустое пространство
                                 let bars: Element<'_, Message> = match side {
                                     "bottom" => column![
                                         group_bar,
@@ -4119,7 +3980,6 @@ impl DreamBreaker {
                             base_cell
                         };
 
-                        // Для property-клеток — mouse_area для карточки наведения
                         let is_prop = cell_map
                             .get(&idx)
                             .map(|c| c.cell_type.as_str() == "property")
@@ -4167,16 +4027,14 @@ impl DreamBreaker {
                 .into();
         }
 
-        // Список собственностей — горизонтальная строка карточек
         let mut prop_list = row![].spacing(self.s(4.0) as u16);
         for (i, prop) in self.player_properties.iter().enumerate() {
             let is_selected = self.selected_property == Some(i);
             let upg = prop.upgrades_count.min(3) as usize;
 
-            // В панели управления: снизу показываем аренду
             let short_name = prop.prop_name.split_whitespace().last().unwrap_or("?");
             let value_label = format!("А:{}", prop.rent_cost);
-            // Цвет группы по cell_index собственности
+
             let prop_hdr_hex = {
                 let idx = prop.cell_index;
                 let pos_on_side = idx % 10;
@@ -4246,19 +4104,16 @@ impl DreamBreaker {
         ]
         .spacing(self.s(4.0) as u16);
 
-        // Детали выбранной собственности
         if let Some(sel) = self.selected_property {
             if let Some(prop) = self.player_properties.get(sel) {
                 panel_col = panel_col.push(Space::with_height(self.s(6.0)));
 
-                // Заголовок и аренда
                 panel_col = panel_col.push(
                     text(format!("{} | Аренда: {}", prop.prop_name, prop.rent_cost))
                         .size(self.ts(10)),
                 );
                 panel_col = panel_col.push(Space::with_height(self.s(4.0)));
 
-                // Слоты усилений (3 штуки)
                 let installed: Vec<(String, Uuid)> = if let Some(arr) = prop.upgrades.as_array() {
                     arr.iter()
                         .filter_map(|v| {
@@ -4277,10 +4132,9 @@ impl DreamBreaker {
                 panel_col = panel_col.push(text("Слоты усилений:").size(self.ts(10)));
                 panel_col = panel_col.push(Space::with_height(self.s(2.0)));
 
-                // Слоты по 3 в строку — каждый слот занимает равную долю ширины панели
                 let slots_per_row = 3usize;
                 let slot_gap = self.s(4.0);
-                // ширина одной плитки с учётом отступов между ними
+
                 let slot_w = ((panel_w - slot_gap * (slots_per_row as f32 - 1.0))
                     / slots_per_row as f32)
                     .floor();
@@ -4355,7 +4209,6 @@ impl DreamBreaker {
                     panel_col = panel_col.push(Space::with_height(self.s(2.0)));
                 }
 
-                // Инвентарь для установки (только если есть свободный слот)
                 if installed.len() < max_slots && !self.inventory.is_empty() {
                     panel_col = panel_col.push(Space::with_height(self.s(6.0)));
                     panel_col = panel_col.push(text("Установить из инвентаря:").size(self.ts(10)));
@@ -4516,9 +4369,6 @@ impl DreamBreaker {
     }
 }
 
-// ─────────────────────────────────────────────
-// Вспомогательные UI функции
-// ─────────────────────────────────────────────
 #[derive(Debug, Clone, Copy)]
 enum Icon {
     Play,
@@ -4572,20 +4422,12 @@ fn profile_dropdown_btn<'a>(label: &'a str, msg: Message, sc: f32) -> Button<'a,
         .padding((8.0 * sc) as u16)
 }
 
-/// Собирает SVG карточки собственности с вписанным названием и ценой.
-///
-/// Читает шаблон `assets/property_{upgrades}.svg` (0–3) и инжектирует два
-/// `<text>` элемента прямо перед `</svg>`:
-///   • название — верхняя зона (y≈280, над разделительной линией y≈296)
-///   • value_label — нижняя зона (y≈507, под разделительной линией y≈496)
-///
-/// viewBox карточек: "256 256 256 256" → центр X = 256 + 128 = 384.
 fn property_svg_handle(
     upgrades: usize,
     name: &str,
     value_label: &str,
-    header_color: &str,        // hex цвет группы, например "#88ccff"
-    owner_color: Option<&str>, // hex цвет владельца, None если свободна
+    header_color: &str,
+    owner_color: Option<&str>,
 ) -> iced::widget::svg::Handle {
     let path = format!("assets/property_{}.svg", upgrades.min(3));
     let template = std::fs::read_to_string(&path).unwrap_or_else(|_| {
@@ -4598,8 +4440,6 @@ fn property_svg_handle(
     let name_short: String = name.chars().take(8).collect();
     let value_short: String = value_label.chars().take(8).collect();
 
-    // Верхняя зона (заголовок): y=256..296, высота=40
-    // Нижняя зона владельца: от линии под ценой (y≈496) до края (512)
     let owner_rect = match owner_color {
         Some(oc) => format!(
             "<rect x=\"256\" y=\"496\" width=\"256\" height=\"16\" fill=\"{}\" opacity=\"0.9\"/>",
@@ -4627,7 +4467,6 @@ fn property_svg_handle(
     iced::widget::svg::Handle::from_memory(svg_with_text.into_bytes())
 }
 
-/// Экранирует спецсимволы XML для безопасной вставки в SVG text.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

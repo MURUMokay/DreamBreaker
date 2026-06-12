@@ -1,13 +1,3 @@
--- =============================================================
--- DreamBreaker — все функции базы данных.
--- Вся бизнес-логика инкапсулирована здесь.
--- Rust вызывает эти функции, не пишет прямые INSERT/SELECT.
--- =============================================================
--- -------------------------------------------------------------------
--- БЛОК 1: Пользователи (Игроки)
--- -------------------------------------------------------------------
--- Создать пользователя. Принимает уже хешированный пароль (хеш делается в Rust).
--- Возвращает UUID нового пользователя.
 DROP FUNCTION IF EXISTS register_new_user(TEXT, TEXT, TEXT);
 
 CREATE OR REPLACE FUNCTION register_new_user(
@@ -23,7 +13,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Получить credentials пользователя по имени для проверки пароля в Rust.
 DROP FUNCTION IF EXISTS get_user_credentials(TEXT);
 
 CREATE OR REPLACE FUNCTION get_user_credentials(p_username TEXT)
@@ -36,7 +25,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Получить полные данные пользователя по его ID.
 DROP FUNCTION IF EXISTS get_user_by_id(UUID);
 
 CREATE OR REPLACE FUNCTION get_user_by_id(p_user_id UUID)
@@ -53,7 +41,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- Получить список всех пользователей (для меню выбора профиля).
 DROP FUNCTION IF EXISTS list_users();
 
 CREATE OR REPLACE FUNCTION list_users()
@@ -67,9 +54,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- -------------------------------------------------------------------
--- БЛОК 2: Игры
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS create_game_with_rules(BIGINT, BIGINT, INT, BIGINT);
 
 CREATE OR REPLACE FUNCTION create_game_with_rules(
@@ -182,9 +166,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- -------------------------------------------------------------------
--- БЛОК 3: Участники игры
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS add_game_participant(UUID, UUID, INT);
 
 CREATE OR REPLACE FUNCTION add_game_participant(
@@ -214,9 +195,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- -------------------------------------------------------------------
--- БЛОК 4: Усиления и инвентарь
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS list_power_ups();
 
 CREATE OR REPLACE FUNCTION list_power_ups()
@@ -256,10 +234,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- -------------------------------------------------------------------
--- ВСПОМОГАТЕЛЬНАЯ: проверка что игра ещё активна.
--- Вызывается в начале всех функций, изменяющих состояние партии.
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS assert_game_active(UUID);
 CREATE OR REPLACE FUNCTION assert_game_active(p_game_id UUID) RETURNS VOID AS $$
 BEGIN
@@ -272,9 +246,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- -------------------------------------------------------------------
--- БЛОК 5: Ходы
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS commit_player_move(UUID, UUID, INT);
 CREATE OR REPLACE FUNCTION commit_player_move(
     p_game_id      UUID,
@@ -328,9 +299,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- -------------------------------------------------------------------
--- БЛОК 6: Покупка собственности и аренда
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS buy_property(UUID, UUID, INT);
 CREATE OR REPLACE FUNCTION buy_property(
     p_game_id    UUID,
@@ -393,7 +361,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-
 DROP FUNCTION IF EXISTS pay_rent(UUID, UUID, INT);
 CREATE OR REPLACE FUNCTION pay_rent(
     p_game_id    UUID,
@@ -451,9 +418,6 @@ v_rent := calc_rent(p_game_id, v_prop_id);
 END;
 $$ LANGUAGE plpgsql;
 
--- -------------------------------------------------------------------
--- БЛОК 7: Магазин усилений
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS get_shop_slots(UUID, UUID, UUID);
 CREATE OR REPLACE FUNCTION get_shop_slots(
     p_shop_id  UUID,
@@ -495,7 +459,6 @@ BEGIN
     ORDER BY ss.slot_index;
 END;
 $$ LANGUAGE plpgsql;
-
 
 DROP FUNCTION IF EXISTS buy_shop_slot(UUID, UUID, UUID);
 CREATE OR REPLACE FUNCTION buy_shop_slot(
@@ -558,7 +521,6 @@ BEGIN
     RETURN QUERY SELECT v_pos, v_bal, v_moves, v_spent, v_earned;
 END;
 $$ LANGUAGE plpgsql;
-
 
 DROP FUNCTION IF EXISTS reroll_shop(UUID, UUID, UUID);
 CREATE OR REPLACE FUNCTION reroll_shop(
@@ -652,9 +614,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- -------------------------------------------------------------------
--- БЛОК 8: Продажа усилений
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS sell_power_up(UUID, UUID, UUID);
 CREATE OR REPLACE FUNCTION sell_power_up(
     p_game_id     UUID,
@@ -722,9 +681,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- -------------------------------------------------------------------
--- БЛОК 9: Проверка банкротства
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS get_all_balances(UUID);
 CREATE OR REPLACE FUNCTION get_all_balances(p_game_id UUID)
 RETURNS TABLE (user_id UUID, balance BIGINT, user_type TEXT) AS $$
@@ -737,9 +693,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- -------------------------------------------------------------------
--- БЛОК 10: Налог
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS pay_tax(UUID, UUID);
 CREATE OR REPLACE FUNCTION pay_tax(
     p_game_id UUID,

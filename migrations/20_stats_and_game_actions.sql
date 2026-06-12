@@ -1,11 +1,3 @@
--- =============================================================
--- DreamBreaker — функции статистики профиля, сдачи, сохранения.
--- =============================================================
-
-
--- -------------------------------------------------------------------
--- Сохранить и выйти: перевести игру в paused.
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS pause_game(UUID, UUID);
 CREATE OR REPLACE FUNCTION pause_game(p_game_id UUID, p_user_id UUID)
 RETURNS VOID AS $$
@@ -28,10 +20,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
-
--- -------------------------------------------------------------------
--- Сдаться: перевести игру в surrender.
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS surrender_game(UUID, UUID);
 CREATE OR REPLACE FUNCTION surrender_game(p_game_id UUID, p_user_id UUID)
 RETURNS VOID AS $$
@@ -54,10 +42,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
-
--- -------------------------------------------------------------------
--- Статистика профиля (динамически по завершённым играм).
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS get_user_stats(UUID);
 CREATE OR REPLACE FUNCTION get_user_stats(p_user_id UUID)
 RETURNS TABLE (
@@ -121,10 +105,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
-
--- -------------------------------------------------------------------
--- Получить итоги завершённой игры для экрана завершения.
--- -------------------------------------------------------------------
 DROP FUNCTION IF EXISTS get_game_result(UUID, UUID);
 CREATE OR REPLACE FUNCTION get_game_result(p_game_id UUID, p_user_id UUID)
 RETURNS TABLE (

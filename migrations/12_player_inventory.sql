@@ -1,5 +1,3 @@
--- Сущность ER: "Инвентарь" (ID участника игры PK/FK, ID усиления FK).
--- Связь "Имеет": участник (1) имеет усиления в инвентаре (M).
 CREATE TABLE player_inventory (
     game_id UUID NOT NULL,
     user_id UUID NOT NULL,

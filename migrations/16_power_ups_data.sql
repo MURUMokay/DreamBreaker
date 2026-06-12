@@ -1,18 +1,7 @@
--- =============================================================
--- DreamBreaker — начальные данные: усиления (power_ups).
--- 15 усилений трёх типов.
--- =============================================================
-
--- Очищаем перед вставкой (безопасно при повторном применении)
 TRUNCATE TABLE player_inventory CASCADE;
 TRUNCATE TABLE shop_slots CASCADE;
 TRUNCATE TABLE power_ups CASCADE;
 
--- -------------------------------------------------------------------
--- ТИП 1: +X к базовой стоимости аренды (flat_base)
--- Применяется ДО умножения на процент.
--- effect: { "type": "flat_base", "value": N }
--- -------------------------------------------------------------------
 INSERT INTO power_ups (name, description, cost, effect) VALUES
 (
     'Аренда: +15 к базе',
@@ -45,11 +34,6 @@ INSERT INTO power_ups (name, description, cost, effect) VALUES
     '{"type": "flat_base", "value": 100}'::JSONB
 );
 
--- -------------------------------------------------------------------
--- ТИП 2: +X% к проценту аренды (percent_bonus)
--- Применяется ко множителю. Базовый процент 11%, суммируется.
--- effect: { "type": "percent_bonus", "value": N }
--- -------------------------------------------------------------------
 INSERT INTO power_ups (name, description, cost, effect) VALUES
 (
     'Процент: +2% к аренде',
@@ -82,11 +66,6 @@ INSERT INTO power_ups (name, description, cost, effect) VALUES
     '{"type": "percent_bonus", "value": 12}'::JSONB
 );
 
--- -------------------------------------------------------------------
--- ТИП 3: +X к итоговой аренде (flat_final)
--- Применяется ПОСЛЕ умножения на процент (к итоговой сумме).
--- effect: { "type": "flat_final", "value": N }
--- -------------------------------------------------------------------
 INSERT INTO power_ups (name, description, cost, effect) VALUES
 (
     'Доход: +10 к итогу',

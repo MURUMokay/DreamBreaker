@@ -1,17 +1,10 @@
 #![allow(warnings)]
 #![allow(clippy::all)]
-//! Работа с базой данных DreamBreaker.
-//!
-//! Rust не пишет прямые INSERT/SELECT — вся логика инкапсулирована
-//! в функциях PostgreSQL (migrations/4_functions.sql).
-//! Здесь только: подключение, миграции и вызовы этих функций.
 
 use bcrypt::{hash, verify, DEFAULT_COST};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::types::Uuid;
 use std::time::Duration;
-
-// ----- Ошибки -----
 
 #[derive(Debug, Clone)]
 pub struct DbError(pub String);
@@ -31,8 +24,6 @@ impl From<bcrypt::BcryptError> for DbError {
         DbError(format!("Bcrypt: {}", e))
     }
 }
-
-// ----- Модели -----
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct User {
@@ -81,7 +72,6 @@ pub struct InventoryItem {
     pub effect: serde_json::Value,
 }
 
-/// Клетка игрового поля со всеми связанными данными.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BoardCell {
     pub cell_index: i32,
@@ -93,10 +83,8 @@ pub struct BoardCell {
     pub owner_user_id: Option<Uuid>,
     pub shop_id: Option<Uuid>,
     pub refresh_cost: Option<i64>,
-    // upgrades_count намеренно отсутствует — вычисляется в UI из player_properties
 }
 
-/// Собственность игрока с установленными усилениями.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PlayerProperty {
     pub property_id: Uuid,
@@ -104,12 +92,11 @@ pub struct PlayerProperty {
     pub prop_name: String,
     pub purchase_cost: i64,
     pub rent_cost: i64,
-    pub upgrades: serde_json::Value, // JSON-массив установленных усилений
+    pub upgrades: serde_json::Value,
     pub upgrades_count: i32,
     pub max_upgrades: i32,
 }
 
-/// Состояние игрока на экране игры.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ParticipantState {
     pub position: i32,
@@ -118,8 +105,6 @@ pub struct ParticipantState {
     pub total_spent: i64,
     pub total_earned: i64,
 }
-
-// ----- Подключение и миграции -----
 
 pub async fn connect(database_url: &str) -> Result<PgPool, DbError> {
     let pool = PgPoolOptions::new()
@@ -135,9 +120,6 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), DbError> {
     Ok(())
 }
 
-// ----- БЛОК 1: Пользователи -----
-
-/// Вызывает функцию БД: register_new_user(username, type, password_hash).
 pub async fn register_user(pool: &PgPool, username: &str, password: &str) -> Result<Uuid, DbError> {
     let password_hash = hash(password, DEFAULT_COST)?;
     let row: (Uuid,) = sqlx::query_as("SELECT register_new_user($1, $2, $3)")
@@ -149,7 +131,6 @@ pub async fn register_user(pool: &PgPool, username: &str, password: &str) -> Res
     Ok(row.0)
 }
 
-/// Вызывает функции БД: get_user_credentials(), get_user_by_id().
 pub async fn authenticate_user(
     pool: &PgPool,
     username: &str,
@@ -192,7 +173,7 @@ pub async fn get_user_by_id(pool: &PgPool, user_id: Uuid) -> Result<Option<User>
     .await?;
     Ok(user)
 }
-/// Вызывает функцию БД: list_users().
+
 pub async fn list_users(pool: &PgPool) -> Result<Vec<(Uuid, String)>, DbError> {
     let users: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, username FROM list_users()")
         .fetch_all(pool)
@@ -200,10 +181,6 @@ pub async fn list_users(pool: &PgPool) -> Result<Vec<(Uuid, String)>, DbError> {
     Ok(users)
 }
 
-// ----- БЛОК 2: Игры -----
-
-/// Создать новую игру с полем, ботами и участником за одну транзакцию.
-/// Вызывает функцию БД: create_game_full(seed, balance, turns, target, user_id).
 pub async fn create_game(
     pool: &PgPool,
     seed: i64,
@@ -223,7 +200,6 @@ pub async fn create_game(
     Ok(row.0)
 }
 
-/// Вызывает функцию БД: get_game_rules(game_id).
 pub async fn get_game_rules(pool: &PgPool, game_id: Uuid) -> Result<Option<GameRules>, DbError> {
     let rules = sqlx::query_as::<_, GameRules>(
         "SELECT game_id, starting_balance, max_turns, target_balance
@@ -235,7 +211,6 @@ pub async fn get_game_rules(pool: &PgPool, game_id: Uuid) -> Result<Option<GameR
     Ok(rules)
 }
 
-/// Вызывает функцию БД: get_active_game(user_id).
 pub async fn get_active_game_for_user(
     pool: &PgPool,
     user_id: Uuid,
@@ -247,7 +222,6 @@ pub async fn get_active_game_for_user(
     Ok(row.and_then(|(id,)| id))
 }
 
-/// Вызывает функцию БД: get_user_games(user_id).
 pub async fn get_user_games(
     pool: &PgPool,
     user_id: Uuid,
@@ -261,7 +235,6 @@ pub async fn get_user_games(
     Ok(games)
 }
 
-/// Вызывает функцию БД: set_game_status(game_id, status).
 pub async fn set_game_status(pool: &PgPool, game_id: Uuid, status: &str) -> Result<(), DbError> {
     sqlx::query("SELECT set_game_status($1, $2)")
         .bind(game_id)
@@ -271,9 +244,6 @@ pub async fn set_game_status(pool: &PgPool, game_id: Uuid, status: &str) -> Resu
     Ok(())
 }
 
-// ----- БЛОК 3: Игровое поле -----
-
-/// Вызывает функцию БД: get_board_cells(game_id).
 pub async fn get_board_cells(pool: &PgPool, game_id: Uuid) -> Result<Vec<BoardCell>, DbError> {
     let cells = sqlx::query_as::<_, BoardCell>(
         "SELECT cell_index, cell_type, tax_amount,
@@ -287,7 +257,6 @@ pub async fn get_board_cells(pool: &PgPool, game_id: Uuid) -> Result<Vec<BoardCe
     Ok(cells)
 }
 
-/// Вызывает функцию БД: get_participant_state(game_id, user_id).
 pub async fn get_participant_state(
     pool: &PgPool,
     game_id: Uuid,
@@ -304,7 +273,6 @@ pub async fn get_participant_state(
     Ok(state)
 }
 
-/// Загрузить всё нужное для экрана игры за один вызов.
 pub async fn load_game_screen(
     pool: &PgPool,
     game_id: Uuid,
@@ -334,9 +302,6 @@ pub async fn load_game_screen(
     Ok((rules, state, cells, inventory, properties))
 }
 
-// ----- БЛОК 4: Участники -----
-
-/// Вызывает функцию БД: list_game_participants(game_id).
 pub async fn list_participants(
     pool: &PgPool,
     game_id: Uuid,
@@ -352,9 +317,6 @@ pub async fn list_participants(
     Ok(participants)
 }
 
-// ----- БЛОК 5: Усиления и инвентарь -----
-
-/// Вызывает функцию БД: add_to_inventory(game_id, user_id, power_up_id, quantity).
 pub async fn add_to_inventory(
     pool: &PgPool,
     game_id: Uuid,
@@ -372,7 +334,6 @@ pub async fn add_to_inventory(
     Ok(())
 }
 
-/// Вызывает функцию БД: get_player_inventory(game_id, user_id).
 pub async fn get_player_inventory(
     pool: &PgPool,
     game_id: Uuid,
@@ -389,10 +350,6 @@ pub async fn get_player_inventory(
     Ok(items)
 }
 
-// ----- БЛОК 6: Игровые действия -----
-
-/// Сохранить и выйти: статус -> paused.
-/// Вызывает функцию БД: pause_game(game_id, user_id).
 pub async fn pause_game(pool: &PgPool, game_id: Uuid, user_id: Uuid) -> Result<(), DbError> {
     sqlx::query("SELECT pause_game($1, $2)")
         .bind(game_id)
@@ -402,8 +359,6 @@ pub async fn pause_game(pool: &PgPool, game_id: Uuid, user_id: Uuid) -> Result<(
     Ok(())
 }
 
-/// Сдаться: статус -> surrender.
-/// Вызывает функцию БД: surrender_game(game_id, user_id).
 pub async fn surrender_game(pool: &PgPool, game_id: Uuid, user_id: Uuid) -> Result<(), DbError> {
     sqlx::query("SELECT surrender_game($1, $2)")
         .bind(game_id)
@@ -413,9 +368,6 @@ pub async fn surrender_game(pool: &PgPool, game_id: Uuid, user_id: Uuid) -> Resu
     Ok(())
 }
 
-// ----- БЛОК 7: Статистика -----
-
-/// Статистика профиля по завершённым играм.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UserStats {
     pub total_games: i32,
@@ -428,7 +380,6 @@ pub struct UserStats {
     pub power_ups_bought: i64,
 }
 
-/// Вызывает функцию БД: get_user_stats(user_id).
 pub async fn get_user_stats(pool: &PgPool, user_id: Uuid) -> Result<UserStats, DbError> {
     let stats = sqlx::query_as::<_, UserStats>(
         "SELECT total_games, total_wins, current_win_streak,
@@ -442,9 +393,6 @@ pub async fn get_user_stats(pool: &PgPool, user_id: Uuid) -> Result<UserStats, D
     Ok(stats)
 }
 
-// ----- БЛОК 8: Результат игры -----
-
-/// Итоги завершённой игры для экрана завершения.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct GameResult {
     pub game_status: String,
@@ -457,7 +405,6 @@ pub struct GameResult {
     pub is_victory: bool,
 }
 
-/// Вызывает функцию БД: get_game_result(game_id, user_id).
 pub async fn get_game_result(
     pool: &PgPool,
     game_id: Uuid,
@@ -475,10 +422,6 @@ pub async fn get_game_result(
     Ok(result)
 }
 
-// ----- БЛОК 9: Последняя игра (для кнопки "Продолжить") -----
-
-/// Вызывает функцию БД: get_latest_user_game(user_id).
-/// Возвращает последнюю активную/приостановленную игру или None.
 pub async fn get_latest_user_game(pool: &PgPool, user_id: Uuid) -> Result<Option<Uuid>, DbError> {
     let row: Option<(Uuid, String, i64, i32, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "SELECT game_id, status, balance, moves_made, created_at
@@ -506,11 +449,7 @@ pub async fn commit_player_move(
     .await?;
     Ok(state)
 }
-// ----- БЛОК 11: Проверка банкротства -----
 
-/// Получить балансы всех участников игры (для проверки банкротства).
-/// Возвращает (user_id, balance, user_type).
-/// Вызывает функцию БД: get_all_balances(game_id).
 pub async fn get_all_balances(
     pool: &PgPool,
     game_id: Uuid,
@@ -522,8 +461,6 @@ pub async fn get_all_balances(
             .await?;
     Ok(rows)
 }
-
-// ----- БЛОК 12: Покупка и аренда -----
 
 pub async fn buy_property(
     pool: &PgPool,
@@ -560,7 +497,6 @@ pub async fn pay_rent(
     .await?;
     Ok(state)
 }
-// ----- БЛОК 13: Магазин усилений -----
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ShopSlot {
@@ -572,7 +508,7 @@ pub struct ShopSlot {
     pub cost: i64,
     pub status: String,
     pub already_own: bool,
-    pub reroll_count: i32, // <- добавить
+    pub reroll_count: i32,
 }
 
 pub async fn get_shop_slots(
@@ -629,9 +565,7 @@ pub async fn reroll_shop(
     .await?;
     Ok(state)
 }
-// ----- БЛОК 15: Управление собственностью -----
 
-/// Получить список собственностей игрока с установленными усилениями.
 pub async fn get_player_properties(
     pool: &PgPool,
     game_id: Uuid,
@@ -649,8 +583,6 @@ pub async fn get_player_properties(
     Ok(props)
 }
 
-/// Установить усиление в собственность.
-/// Возвращает "ok" или текст ошибки.
 pub async fn install_upgrade(
     pool: &PgPool,
     game_id: Uuid,
@@ -668,8 +600,6 @@ pub async fn install_upgrade(
     Ok(row.0)
 }
 
-/// Извлечь усиление из собственности обратно в инвентарь.
-/// Возвращает "ok" или текст ошибки.
 pub async fn uninstall_upgrade(
     pool: &PgPool,
     game_id: Uuid,
@@ -687,9 +617,6 @@ pub async fn uninstall_upgrade(
     Ok(row.0)
 }
 
-// ----- БЛОК 16: Боты -----
-
-/// Данные одного бота-участника.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BotParticipant {
     pub user_id: Uuid,
@@ -699,7 +626,6 @@ pub struct BotParticipant {
     pub turn_order: i32,
 }
 
-/// Результат одного хода бота.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BotTurnResult {
     pub new_position: i32,
@@ -708,7 +634,6 @@ pub struct BotTurnResult {
     pub action_detail: String,
 }
 
-/// Получить список живых ботов игры.
 pub async fn get_bot_participants(
     pool: &PgPool,
     game_id: Uuid,
@@ -723,7 +648,6 @@ pub async fn get_bot_participants(
     Ok(bots)
 }
 
-/// Выполнить один ход бота.
 pub async fn do_bot_turn(
     pool: &PgPool,
     game_id: Uuid,
@@ -757,7 +681,6 @@ pub async fn pay_tax(
     .await?;
     Ok(state)
 }
-// ----- БЛОК 14: Продажа усилений -----
 
 pub async fn sell_power_up(
     pool: &PgPool,
