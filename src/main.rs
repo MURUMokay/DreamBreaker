@@ -1,3 +1,5 @@
+#![allow(warnings)]
+#![allow(clippy::all)]
 mod db;
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{

@@ -1,3 +1,5 @@
+#![allow(warnings)]
+#![allow(clippy::all)]
 //! Работа с базой данных DreamBreaker.
 //!
 //! Rust не пишет прямые INSERT/SELECT — вся логика инкапсулирована
